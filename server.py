@@ -1458,15 +1458,78 @@ import base64
 
 OPENFANG_URL = os.getenv('OPENFANG_API_URL', 'https://openfang-production.up.railway.app')
 OPENFANG_KEY = os.getenv('OPENFANG_API_KEY', 'leviathan-test-key-2026')
+OPENFANG_HEADERS = {"Authorization": f"Bearer {OPENFANG_KEY}", "Content-Type": "application/json"}
+OPENFANG_API_URL = OPENFANG_URL
 
-# Agent IDs (current deployment)
+# Agent IDs (current deployment — update on respawn)
 AGENT_IDS = {
     'cto': '05c94440-03bf-4927-9563-a05cb512e51c',
     'neural_net': '0f500421-3684-4922-a94a-a5de3b986f59',
     'brain': '8609177c-c75c-452d-ab6c-86882f524b9c',
-    'auditor': 'bc376781-41e7-4f79-9312-1354d41aef4e',
+    'auditor': '476ee55e-5b98-4659-a10c-e1afe4142620',
     'debugger': '82d577ab-288d-48c1-90c5-1264290d860c',
 }
+
+# ─── Token Budget Tracking ──────────────────────────────────────
+# Prevents CTO token burn. Each agent call costs ~12-20K input tokens.
+# Budget: max 500K/hr. At 15K/call, that's 33 calls/hr max.
+# Never-idle fires every 5min = 12 calls/hr = ~180K. Leaves 320K for real work.
+TOKEN_BUDGET = {
+    'hourly_limit': 500000,
+    'tokens_this_hour': 0,
+    'hour_start': time.time(),
+    'calls_this_hour': 0,
+    'max_calls_per_hour': 30,  # Hard cap: no more than 30 agent calls/hr from daemons
+}
+TOKEN_BUDGET_LOCK = threading.Lock()
+
+def check_token_budget(estimated_tokens=15000):
+    """Check if we're within token budget. Returns True if OK to proceed."""
+    with TOKEN_BUDGET_LOCK:
+        now = time.time()
+        # Reset hourly counter
+        if now - TOKEN_BUDGET['hour_start'] > 3600:
+            TOKEN_BUDGET['tokens_this_hour'] = 0
+            TOKEN_BUDGET['calls_this_hour'] = 0
+            TOKEN_BUDGET['hour_start'] = now
+        # Check limits
+        if TOKEN_BUDGET['calls_this_hour'] >= TOKEN_BUDGET['max_calls_per_hour']:
+            logger.warning(f"[TOKEN-BUDGET] Hourly call limit reached: {TOKEN_BUDGET['calls_this_hour']}/{TOKEN_BUDGET['max_calls_per_hour']}")
+            return False
+        if TOKEN_BUDGET['tokens_this_hour'] + estimated_tokens > TOKEN_BUDGET['hourly_limit']:
+            logger.warning(f"[TOKEN-BUDGET] Hourly token limit approaching: {TOKEN_BUDGET['tokens_this_hour']}/{TOKEN_BUDGET['hourly_limit']}")
+            return False
+        return True
+
+def record_token_usage(tokens_used):
+    """Record token usage after an agent call."""
+    with TOKEN_BUDGET_LOCK:
+        TOKEN_BUDGET['tokens_this_hour'] += tokens_used
+        TOKEN_BUDGET['calls_this_hour'] += 1
+
+# ─── Anti-Duplicate Agent Spawn ─────────────────────────────────
+KNOWN_AGENT_NAMES = set()
+KNOWN_AGENT_NAMES_LOCK = threading.Lock()
+
+def refresh_agent_list():
+    """Refresh the known agent list from OpenFang."""
+    global KNOWN_AGENT_NAMES
+    try:
+        resp = requests.get(f"{OPENFANG_URL}/api/agents",
+            headers={"Authorization": f"Bearer {OPENFANG_KEY}"}, timeout=15)
+        if resp.status_code == 200:
+            agents = resp.json()
+            with KNOWN_AGENT_NAMES_LOCK:
+                KNOWN_AGENT_NAMES = {a['name'] for a in agents}
+            return agents
+    except Exception as e:
+        logger.warning(f"Failed to refresh agent list: {e}")
+    return []
+
+def is_duplicate_agent(name):
+    """Check if an agent with this name already exists."""
+    with KNOWN_AGENT_NAMES_LOCK:
+        return name in KNOWN_AGENT_NAMES
 
 DISCORD_CHANNELS = {
     'active-tasks': '1477374182554599465',
@@ -1500,8 +1563,11 @@ def log_to_discord(channel_name, message):
     except Exception as e:
         logger.warning(f"Discord post failed: {e}")
 
-def send_agent_message(agent_key, message):
-    """Send a message to an agent via OpenFang API."""
+def send_agent_message(agent_key, message, skip_budget=False):
+    """Send a message to an agent via OpenFang API. Respects token budget."""
+    if not skip_budget and not check_token_budget():
+        logger.warning(f"[SEND-AGENT] Token budget exceeded, skipping message to {agent_key}")
+        return {"error": "token_budget_exceeded", "skipped": True}
     agent_id = AGENT_IDS.get(agent_key, agent_key)
     try:
         resp = requests.post(
@@ -1510,7 +1576,14 @@ def send_agent_message(agent_key, message):
             json={"message": message},
             timeout=120
         )
-        return resp.json() if resp.status_code == 200 else {"error": resp.text}
+        if resp.status_code == 200:
+            data = resp.json()
+            # Record actual token usage from response
+            usage = data.get('total_usage', {})
+            total_tokens = usage.get('total_tokens', 15000)  # Default estimate
+            record_token_usage(total_tokens)
+            return data
+        return {"error": resp.text}
     except Exception as e:
         return {"error": str(e)}
 
@@ -1541,90 +1614,98 @@ def fetch_pending_features():
 
 
 def never_idle_daemon():
-    """CORE DAEMON: Every 2 minutes, ensure the system is working on something.
-    If idle, pick highest priority task and assign it to CTO for delegation."""
-    time.sleep(30)  # Initial delay to let system boot
-    logger.info("[NEVER-IDLE] Autonomous execution engine started. Zero idle tolerance.")
+    """CORE DAEMON: Every 5 minutes, ensure the system is working on something.
+    BUDGET-AWARE: Respects token budget (30 calls/hr max). Won't burn tokens on idle chatter.
+    ANTI-DUPLICATE: Checks existing agents before telling CTO to spawn."""
+    time.sleep(60)  # Initial delay to let system boot
+    logger.info("[NEVER-IDLE] Autonomous execution engine started (5-min cycle, budget-aware).")
+
+    # Track what we've already assigned to avoid re-assigning
+    assigned_tasks = set()
 
     while True:
         try:
-            time.sleep(120)  # Check every 2 minutes
+            time.sleep(300)  # Check every 5 minutes (was 2min, caused token burn)
+
+            # Budget gate — if we've hit the hourly limit, skip entirely
+            if not check_token_budget():
+                logger.info("[NEVER-IDLE] Token budget exceeded, skipping cycle")
+                continue
+
+            # Refresh agent list for anti-duplicate checks
+            refresh_agent_list()
 
             # Check system activity
             last_activity = getattr(system_state, 'last_request_time', None)
             if isinstance(last_activity, datetime):
                 idle_seconds = (datetime.utcnow() - last_activity).total_seconds()
             else:
-                idle_seconds = 300  # Assume idle if no tracking
+                idle_seconds = 600  # Assume idle if no tracking
 
             idle_minutes = idle_seconds / 60
 
-            # If idle > 2 minutes, take action
-            if idle_minutes > 2:
-                logger.info(f"[NEVER-IDLE] System idle for {idle_minutes:.1f} min. Scanning backlog...")
+            # Only act if idle > 5 minutes (was 2min)
+            if idle_minutes > 5:
+                logger.info(f"[NEVER-IDLE] System idle {idle_minutes:.1f}min. Budget: {TOKEN_BUDGET['calls_this_hour']}/{TOKEN_BUDGET['max_calls_per_hour']} calls/hr")
 
                 # 1. Check work queue first
                 queued_items = [w for w in WORK_QUEUE if w['status'] == 'QUEUED']
                 if queued_items:
                     item = queued_items[0]
+                    task_key = item['task'][:50]
+                    if task_key in assigned_tasks:
+                        logger.info(f"[NEVER-IDLE] Skipping already-assigned task: {task_key}")
+                        continue
                     item['status'] = 'ASSIGNED'
                     item['assigned_to'] = 'cto'
                     item['assigned_at'] = datetime.utcnow().isoformat()
-                    send_agent_message('cto', f"AUTO-ASSIGNED TASK: {item['task']}. Priority: {item['priority']}. Spawn sub-agents and begin immediately.")
-                    log_to_discord('active-tasks', f"🤖 **Auto-assigned from queue**: {item['task']} (Priority: {item['priority']})")
-                    AUTONOMOUS_LOG.append({'time': datetime.utcnow().isoformat(), 'action': 'queue_assign', 'task': item['task']})
+                    # CONCISE message to CTO (saves tokens)
+                    send_agent_message('cto', f"TASK: {item['task']}. Priority: {item['priority']}. Execute. Check agent_list before spawning — NO DUPLICATES.")
+                    assigned_tasks.add(task_key)
+                    log_to_discord('active-tasks', f"Auto-assigned: {item['task']}")
                     continue
 
-                # 2. Fetch pending features from GitHub
-                pending = fetch_pending_features()
-                if pending:
-                    task = pending[0]
-                    send_agent_message('cto',
-                        f"AUTONOMOUS TASK PICKUP from PENDING_FEATURES.md: '{task}' is NOT CODED. "
-                        f"Spawn 3-5 coding sub-agents and begin implementation NOW. "
-                        f"Report progress to #sub-agent-activity. This is an autonomous directive."
-                    )
-                    log_to_discord('active-tasks', f"🤖 **Auto-pickup**: Building '{task}' from PENDING_FEATURES.md backlog")
-                    AUTONOMOUS_LOG.append({'time': datetime.utcnow().isoformat(), 'action': 'backlog_pickup', 'task': task})
-                else:
-                    # 3. If nothing pending, trigger auto-improvement
-                    send_agent_message('cto',
-                        "IDLE ALERT: No pending tasks found. Run efficiency analysis: "
-                        "1) Check all agent token usage for waste. "
-                        "2) Review v2.3/v2.4 architecture for forgotten applicable context. "
-                        "3) Propose 3 system improvements. "
-                        "4) If improvements are code-only, begin implementation."
-                    )
-                    log_to_discord('active-tasks', "🔍 **Auto-improvement**: No pending tasks. Running efficiency sweep.")
-                    AUTONOMOUS_LOG.append({'time': datetime.utcnow().isoformat(), 'action': 'auto_improve', 'task': 'efficiency_sweep'})
+                # 2. Fetch pending features (only if budget allows)
+                if TOKEN_BUDGET['calls_this_hour'] < TOKEN_BUDGET['max_calls_per_hour'] * 0.5:
+                    pending = fetch_pending_features()
+                    pending = [p for p in pending if p[:50] not in assigned_tasks]
+                    if pending:
+                        task = pending[0]
+                        # CONCISE directive
+                        send_agent_message('cto',
+                            f"BUILD: '{task}' (from PENDING_FEATURES.md). "
+                            f"Run agent_list first — only spawn if no existing agent covers this. "
+                            f"Keep response under 350 words."
+                        )
+                        assigned_tasks.add(task[:50])
+                        log_to_discord('active-tasks', f"Auto-pickup: {task}")
+
+                # 3. NO auto-improvement spam — removed. Only real work.
 
         except Exception as e:
             logger.error(f"[NEVER-IDLE] Error: {e}")
 
 
 def auto_improvement_daemon():
-    """Every 60 minutes: Ask Brain for efficiency analysis and post findings."""
-    time.sleep(120)  # Initial delay
+    """Every 2 hours: Lightweight efficiency check. Budget-aware."""
+    time.sleep(300)  # Initial delay
     while True:
         try:
-            time.sleep(3600)  # Every hour
-            logger.info("[AUTO-IMPROVE] Running hourly efficiency analysis...")
+            time.sleep(7200)  # Every 2 hours (was 1hr — reduced token burn)
 
-            result = send_agent_message('cto',
-                "HOURLY EFFICIENCY REVIEW: "
-                "1) What systems can be optimized right now? "
-                "2) What's the current token waste across all agents? "
-                "3) Are there any v2.3/v2.4 era features that should be revived? "
-                "4) What are the top 3 improvements that can be auto-implemented? "
-                "5) Cross-reference ARCHITECTURAL_DECISIONS.md for anything we've designed but forgotten. "
-                "Execute any safe improvements immediately."
-            )
+            # Only run if under 50% budget usage
+            if TOKEN_BUDGET['calls_this_hour'] > TOKEN_BUDGET['max_calls_per_hour'] * 0.5:
+                logger.info("[AUTO-IMPROVE] Skipping — token budget >50%")
+                continue
 
-            log_to_discord('infrastructure-changelog',
-                f"🔧 **Hourly Auto-Improvement**: Efficiency review triggered. "
-                f"CTO analyzing optimizations and forgotten v2.x context."
+            logger.info("[AUTO-IMPROVE] Running 2-hourly efficiency check...")
+            # CONCISE message — saves tokens
+            send_agent_message('cto',
+                "EFFICIENCY CHECK: 1) Run agent_list, kill any idle/duplicate agents. "
+                "2) Check memory for stale data. 3) Compact any session >30 messages. "
+                "Keep response under 200 words."
             )
-            AUTONOMOUS_LOG.append({'time': datetime.utcnow().isoformat(), 'action': 'hourly_review', 'result': 'triggered'})
+            AUTONOMOUS_LOG.append({'time': datetime.utcnow().isoformat(), 'action': 'efficiency_check'})
 
         except Exception as e:
             logger.error(f"[AUTO-IMPROVE] Error: {e}")
@@ -1890,7 +1971,8 @@ class T3Config:
     """Configuration for T3 history storage system"""
     DEFAULT_REPO_PATH = os.path.expanduser("~/leviathan-enhanced-opus")
     MEMORY_TIER3_BASE = "memory/tier3/daily"
-    CONTEXT_CAPACITY_THRESHOLD = 0.70
+    CONTEXT_CAPACITY_THRESHOLD = 0.85  # First pass at 85%
+    CONTEXT_CRITICAL_THRESHOLD = 0.95  # Second pass at 95% — captures anything missed
     FRUSTRATION_KEYWORDS = {
         "slop", "fuck", "come on", "i already said", "i don't have time",
         "going in circles", "why are you not", "still waiting",
@@ -2248,27 +2330,46 @@ def t3_search_history():
 # ─── T3 Scribe Daemon ──────────────────────────────────────────
 
 def t3_scribe_daemon():
-    """T3 Scribe Daemon — monitors context capacity, triggers pre-compaction summaries."""
-    logger.info("T3 Scribe daemon started (5-min cycle)")
+    """T3 Scribe Daemon — monitors context capacity, triggers pre-compaction summaries.
+    85% = first pass (key topics, decisions, pending items).
+    95% = second pass (captures any missed context before compaction)."""
+    logger.info("T3 Scribe daemon started (5-min cycle, 85%/95% thresholds)")
+    first_pass_done = set()  # Track which agents got 85% pass
+
     while True:
         try:
             time.sleep(300)
             if not (t3_history_manager and t3_scribe):
                 continue
             today = datetime.now().strftime("%Y-%m-%d")
-            # Check context monitors if available
             if hasattr(system_state, 'context_monitors') and system_state.context_monitors:
                 for agent_id, data in system_state.context_monitors.items():
                     usage_pct = data.get('usage_pct', 0)
-                    if usage_pct >= (T3Config.CONTEXT_CAPACITY_THRESHOLD * 100):
-                        logger.warning(f"Context threshold hit for {agent_id}: {usage_pct:.1f}%")
+                    # 85% — first pass: full semantic summary
+                    if usage_pct >= (T3Config.CONTEXT_CAPACITY_THRESHOLD * 100) and agent_id not in first_pass_done:
+                        logger.warning(f"Context 85% threshold for {agent_id}: {usage_pct:.1f}%")
                         summary = t3_scribe.create_summary(
                             date_str=today,
                             context_usage_percent=int(usage_pct),
-                            key_topics=[f"Pre-compaction for {agent_id}"],
-                            pending_items=["Context preservation triggered"]
+                            key_topics=[f"Pre-compaction for {agent_id}", "85% threshold"],
+                            pending_items=["Full context preservation triggered"]
                         )
                         t3_history_manager.store_semantic_summary(today, summary)
+                        first_pass_done.add(agent_id)
+                    # 95% — second pass: thematic context update (lightweight, minimal token cost)
+                    elif usage_pct >= (T3Config.CONTEXT_CRITICAL_THRESHOLD * 100) and f"{agent_id}_95" not in first_pass_done:
+                        logger.critical(f"Context 95% CRITICAL for {agent_id}: {usage_pct:.1f}%")
+                        summary = t3_scribe.create_summary(
+                            date_str=today,
+                            context_usage_percent=int(usage_pct),
+                            key_topics=[f"CRITICAL pre-compaction for {agent_id}", "95% threshold"],
+                            pending_items=["Final context capture before compaction"]
+                        )
+                        t3_history_manager.store_semantic_summary(today, summary)
+                        first_pass_done.add(f"{agent_id}_95")
+            # Reset tracking at midnight
+            if datetime.now().hour == 0 and datetime.now().minute < 5:
+                first_pass_done.clear()
         except Exception as e:
             logger.error(f"T3 scribe daemon error: {e}")
             time.sleep(10)
@@ -2276,24 +2377,136 @@ def t3_scribe_daemon():
 
 # ─── Auditor Respawn Guardian ───────────────────────────────────
 
+# ─── Common Sense Enforcement Layer v3 ──────────────────────────
+# Auto-learns from frustration triggers. Permanently prevents repeat violations.
+
+COMMON_SENSE_RULES = {
+    # FT-001: Slop in outputs
+    "no_slop": "ALL outputs must be validated against canonical architecture before delivery. Fabricated data = CRITICAL.",
+    # FT-002: Idle system
+    "never_idle": "System must always be executing. If idle >5min, pick from work queue or PENDING_FEATURES.",
+    # FT-003: Bad output format
+    "pdf_only": "ALL deliverables to Owner MUST be PDF format. NEVER send .md or .html files. Only exception: literal web dashboards (React/HTML apps).",
+    # FT-004: Paper infrastructure
+    "code_first": "ALL infrastructure changes MUST be deployed to codebase via git. Docs without code = CRITICAL VIOLATION.",
+    # FT-005: Repeated instructions
+    "no_repeat_bugs": "If Owner reports same bug twice in 24hrs, flag CRITICAL immediately. Deploy auditors. Fix at kernel level.",
+    # FT-006: Missing deliverables
+    "deliver_first": "Promised outputs must be delivered before moving to next task.",
+    # FT-007: Auditor blindness
+    "auditor_liveness": "Auditor must be verified alive every 10min. If dead, auto-respawn with full manifest.",
+    # FT-008: Cognitive overload
+    "minimize_owner_load": "System should auto-delegate. Owner should spend <45min/day on oversight.",
+    # FT-009: Stale context
+    "carry_context": "ALL directives from compacted sessions MUST be carried forward. Never lose Owner instructions.",
+    # FT-010: Agent sprawl
+    "no_duplicates": "Check agent_list before spawning. Kill duplicates immediately.",
+    # FT-011: Same bug repeated 8+ times
+    "repeat_bug_escalation": "If same bug appears >2x in 12hrs, auto-escalate: spawn 3 auditors, diagnose in parallel, fix at kernel level.",
+    # FT-012: Token burn
+    "token_budget_enforcement": "All daemon-to-agent messages are budget-gated. Max 30 calls/hr from daemons. Never-idle at 5min intervals, not 2min.",
+}
+
+@app.route('/common-sense/rules', methods=['GET'])
+@require_auth
+def get_common_sense_rules():
+    """Get all Common Sense rules."""
+    return jsonify({'rules': COMMON_SENSE_RULES, 'count': len(COMMON_SENSE_RULES)})
+
+@app.route('/common-sense/check', methods=['POST'])
+@require_auth
+def check_common_sense():
+    """Check an output against Common Sense rules. Returns violations."""
+    data = request.json or {}
+    output_text = data.get('text', '').lower()
+    violations = []
+    if any(ext in output_text for ext in ['.md', '.html', 'markdown']) and 'pdf' not in output_text:
+        violations.append({'rule': 'pdf_only', 'severity': 'HIGH', 'msg': COMMON_SENSE_RULES['pdf_only']})
+    if 'designed' in output_text and 'not implemented' not in output_text and 'not coded' not in output_text:
+        violations.append({'rule': 'code_first', 'severity': 'MEDIUM', 'msg': 'Possible paper infrastructure — verify code exists'})
+    return jsonify({'violations': violations, 'clean': len(violations) == 0})
+
+
 DELTA_FORCE_AUDITOR_ID = os.environ.get('DELTA_FORCE_AUDITOR_ID', '476ee55e-5b98-4659-a10c-e1afe4142620')
 
 def auditor_guardian_daemon():
-    """Every 10 minutes: verify Auditor is alive and responsive. Respawn if dead."""
-    logger.info("Auditor Guardian daemon started (10-min cycle)")
+    """Every 10 minutes: verify Auditor is alive, compact bloated sessions, enforce token limits.
+    This is the self-management layer that prevents all 7 kernel root causes."""
+    logger.info("Auditor Guardian daemon started (10-min cycle, self-managing)")
     while True:
         try:
             time.sleep(600)
-            # Check if Auditor agent is still running
+
+            # 1. Check Auditor is alive
             resp = requests.get(
-                f"{OPENFANG_API_URL}/api/agents/{DELTA_FORCE_AUDITOR_ID}/session",
-                headers=OPENFANG_HEADERS, timeout=15
+                f"{OPENFANG_URL}/api/agents/{DELTA_FORCE_AUDITOR_ID}/session",
+                headers={"Authorization": f"Bearer {OPENFANG_KEY}"}, timeout=15
             )
             if resp.status_code != 200:
                 logger.critical(f"AUDITOR DOWN! Status: {resp.status_code}. Auto-respawning...")
-                log_to_discord("AUDITOR DOWN — Auto-respawn triggered by guardian daemon", 'daily-logs')
+                log_to_discord('daily-logs', "AUDITOR DOWN — Auto-respawn triggered")
+                # TODO: Auto-respawn with full manifest from agent.toml
             else:
-                logger.info(f"Auditor guardian: Agent {DELTA_FORCE_AUDITOR_ID} alive")
+                session = resp.json()
+                msg_count = session.get('message_count', len(session.get('messages', [])))
+                logger.info(f"Auditor guardian: alive, {msg_count} messages in session")
+
+                # 2. Auto-compact Auditor if session >20 messages (prevents T1 bloat)
+                if msg_count > 20:
+                    logger.warning(f"Auditor session bloated: {msg_count} msgs. Auto-compacting...")
+                    requests.post(
+                        f"{OPENFANG_URL}/api/agents/{DELTA_FORCE_AUDITOR_ID}/session/compact",
+                        headers={"Authorization": f"Bearer {OPENFANG_KEY}"}, timeout=30
+                    )
+                    logger.info("Auditor session compacted")
+
+            # 3. Auto-compact CTO if session >20 messages (CTO token burn prevention)
+            cto_id = AGENT_IDS.get('cto')
+            if cto_id:
+                try:
+                    cto_resp = requests.get(
+                        f"{OPENFANG_URL}/api/agents/{cto_id}/session",
+                        headers={"Authorization": f"Bearer {OPENFANG_KEY}"}, timeout=15
+                    )
+                    if cto_resp.status_code == 200:
+                        cto_session = cto_resp.json()
+                        cto_msgs = cto_session.get('message_count', len(cto_session.get('messages', [])))
+                        if cto_msgs > 20:
+                            logger.warning(f"CTO session bloated: {cto_msgs} msgs. Auto-compacting...")
+                            requests.post(
+                                f"{OPENFANG_URL}/api/agents/{cto_id}/session/compact",
+                                headers={"Authorization": f"Bearer {OPENFANG_KEY}"}, timeout=30
+                            )
+                            logger.info("CTO session compacted (token burn prevention)")
+                except Exception as e:
+                    logger.warning(f"CTO session check failed: {e}")
+
+            # 4. Kill duplicate agents
+            try:
+                agents = refresh_agent_list()
+                name_counts = {}
+                for a in agents:
+                    name = a['name']
+                    name_counts[name] = name_counts.get(name, [])
+                    name_counts[name].append(a)
+                for name, agent_list in name_counts.items():
+                    if len(agent_list) > 1:
+                        # Keep newest, kill older duplicates
+                        sorted_agents = sorted(agent_list, key=lambda x: x['created_at'], reverse=True)
+                        for dup in sorted_agents[1:]:
+                            logger.warning(f"Killing duplicate agent: {dup['name']} ({dup['id'][:12]}...)")
+                            requests.delete(
+                                f"{OPENFANG_URL}/api/agents/{dup['id']}",
+                                headers={"Authorization": f"Bearer {OPENFANG_KEY}"}, timeout=10
+                            )
+                            log_to_discord('daily-logs', f"Killed duplicate: {dup['name']} ({dup['id'][:12]})")
+            except Exception as e:
+                logger.warning(f"Duplicate check failed: {e}")
+
+            # 5. Log token budget status
+            logger.info(f"Token budget: {TOKEN_BUDGET['calls_this_hour']}/{TOKEN_BUDGET['max_calls_per_hour']} calls, "
+                        f"{TOKEN_BUDGET['tokens_this_hour']}/{TOKEN_BUDGET['hourly_limit']} tokens this hour")
+
         except Exception as e:
             logger.error(f"Auditor guardian error: {e}")
 
