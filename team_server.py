@@ -94,12 +94,22 @@ MODELS = {
 
 # ─── Unified API Client ───────────────────────────────────────
 
+API_TIMEOUTS = {
+    'openrouter': 30,   # Gemma (free) — fast
+    'anthropic': 60,    # Opus — slow but worth the wait for architecture
+    'openai': 45,       # Codex — production hardening takes time
+    'xai': 45,          # Grok — prototyping can be heavy
+    'deepseek': 40,     # DeepSeek — reasoning takes a moment
+}
+
+
 def call_model(model_key, system_prompt, user_message, max_tokens=None):
     """Call any model. Returns (text, token_info) or (None, error_string)."""
     cfg = MODELS[model_key]
     provider = cfg['provider']
     model = cfg['model']
     mt = max_tokens or cfg['max_tokens']
+    timeout = API_TIMEOUTS.get(provider, 30)
 
     try:
         if provider == 'openrouter':
@@ -110,7 +120,7 @@ def call_model(model_key, system_prompt, user_message, max_tokens=None):
                     {'role': 'system', 'content': system_prompt},
                     {'role': 'user', 'content': user_message},
                 ]},
-                timeout=25,
+                timeout=timeout,
             )
             resp.raise_for_status()
             d = resp.json()
@@ -125,7 +135,7 @@ def call_model(model_key, system_prompt, user_message, max_tokens=None):
                 headers={'x-api-key': API_KEYS['anthropic'], 'anthropic-version': '2023-06-01', 'content-type': 'application/json'},
                 json={'model': model, 'max_tokens': mt, 'system': system_prompt,
                       'messages': [{'role': 'user', 'content': user_message}]},
-                timeout=30,
+                timeout=timeout,
             )
             resp.raise_for_status()
             d = resp.json()
@@ -142,7 +152,7 @@ def call_model(model_key, system_prompt, user_message, max_tokens=None):
                     {'role': 'system', 'content': system_prompt},
                     {'role': 'user', 'content': user_message},
                 ]},
-                timeout=25,
+                timeout=timeout,
             )
             resp.raise_for_status()
             d = resp.json()
@@ -159,7 +169,7 @@ def call_model(model_key, system_prompt, user_message, max_tokens=None):
                     {'role': 'system', 'content': system_prompt},
                     {'role': 'user', 'content': user_message},
                 ]},
-                timeout=25,
+                timeout=timeout,
             )
             resp.raise_for_status()
             d = resp.json()
@@ -176,7 +186,7 @@ def call_model(model_key, system_prompt, user_message, max_tokens=None):
                     {'role': 'system', 'content': system_prompt},
                     {'role': 'user', 'content': user_message},
                 ]},
-                timeout=25,
+                timeout=timeout,
             )
             resp.raise_for_status()
             d = resp.json()
@@ -405,7 +415,7 @@ def run_pipeline(user_message):
     }
 
     prototype_parts = {}
-    for future in as_completed(grok_futures, timeout=45):
+    for future in as_completed(grok_futures, timeout=60):
         part_name = grok_futures[future]
         try:
             text, tok = future.result(timeout=3)
@@ -444,7 +454,7 @@ def run_pipeline(user_message):
     }
 
     production_parts = {}
-    for future in as_completed(codex_futures, timeout=45):
+    for future in as_completed(codex_futures, timeout=60):
         part_name = codex_futures[future]
         try:
             text, tok = future.result(timeout=3)
