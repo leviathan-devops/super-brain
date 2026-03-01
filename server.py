@@ -95,33 +95,58 @@ system_state = SystemState()
 # ─── Enhanced Gemini Tracker (Separate counters for small/large) ───
 
 class GeminiTracker:
-    """Track Gemini API usage with separate limits for small and large queries."""
+    """Track Gemini API usage with separate limits for small/large queries + forensic reserve.
+
+    CRITICAL: 4 RPD are FORCE-RESERVED for the 6-hour forensic audit cycle.
+    These 4 requests CANNOT be consumed by normal operations — they are exclusively
+    for the Super Brain's automated slop audits. This ensures the forensic auditor
+    NEVER hits rate limit errors, even if the rest of the system exhausts quota.
+
+    Budget allocation (daily):
+      - Small queries: 196 available (200 total - 4 forensic reserve)
+      - Large queries: 50 available (document ingestion)
+      - Forensic reserve: 4 guaranteed (1 per 6hr cycle, 4x safety margin)
+    """
+    FORENSIC_RESERVE = 4  # Minimum RPD reserved for forensic audits — NEVER touchable by normal ops
+
     def __init__(self, daily_small_limit=200, daily_large_limit=50):
         self.daily_small_limit = daily_small_limit
         self.daily_large_limit = daily_large_limit
         self.small_requests_today = 0
         self.large_requests_today = 0
+        self.forensic_requests_today = 0
         self.last_reset = date.today()
         self.request_log = []
 
     def can_use(self, is_large: bool = False) -> bool:
-        """Check if we can use Gemini. Large queries use separate quota."""
+        """Check if we can use Gemini. Normal ops cannot touch forensic reserve."""
         self._maybe_reset()
         if is_large:
             return self.large_requests_today < self.daily_large_limit
-        return self.small_requests_today < self.daily_small_limit
+        # Normal small queries: total limit minus forensic reserve minus already used
+        available = self.daily_small_limit - self.FORENSIC_RESERVE - self.small_requests_today
+        return available > 0
 
-    def record_use(self, purpose: str, tokens_est: int = 0, is_large: bool = False):
+    def can_use_forensic(self) -> bool:
+        """Check if forensic audit can use Gemini. Draws from RESERVED pool — always available."""
+        self._maybe_reset()
+        return self.forensic_requests_today < self.FORENSIC_RESERVE
+
+    def record_use(self, purpose: str, tokens_est: int = 0, is_large: bool = False, is_forensic: bool = False):
         """Record a Gemini API use."""
         self._maybe_reset()
-        if is_large:
+        if is_forensic:
+            self.forensic_requests_today += 1
+            quota_type = "forensic-reserved"
+            remaining = self.FORENSIC_RESERVE - self.forensic_requests_today
+        elif is_large:
             self.large_requests_today += 1
             quota_type = "large"
             remaining = self.daily_large_limit - self.large_requests_today
         else:
             self.small_requests_today += 1
             quota_type = "small"
-            remaining = self.daily_small_limit - self.small_requests_today
+            remaining = (self.daily_small_limit - self.FORENSIC_RESERVE) - self.small_requests_today
 
         self.request_log.append({
             "time": datetime.utcnow().isoformat(),
@@ -138,19 +163,24 @@ class GeminiTracker:
         if today > self.last_reset:
             self.small_requests_today = 0
             self.large_requests_today = 0
+            self.forensic_requests_today = 0
             self.last_reset = today
             self.request_log = []
 
     def status(self) -> dict:
         """Return current tracker status."""
         self._maybe_reset()
+        normal_available = self.daily_small_limit - self.FORENSIC_RESERVE
         return {
             "small_requests_today": self.small_requests_today,
-            "small_daily_limit": self.daily_small_limit,
-            "small_remaining": self.daily_small_limit - self.small_requests_today,
+            "small_daily_limit": normal_available,
+            "small_remaining": normal_available - self.small_requests_today,
             "large_requests_today": self.large_requests_today,
             "large_daily_limit": self.daily_large_limit,
             "large_remaining": self.daily_large_limit - self.large_requests_today,
+            "forensic_reserve": self.FORENSIC_RESERVE,
+            "forensic_used_today": self.forensic_requests_today,
+            "forensic_remaining": self.FORENSIC_RESERVE - self.forensic_requests_today,
             "last_reset": self.last_reset.isoformat(),
             "recent_requests": self.request_log[-10:]
         }
