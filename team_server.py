@@ -622,6 +622,277 @@ def detect_slop(text):
     return triggers
 
 
+# ─── KNOWLEDGE HARVESTER (Active Extraction Daemon) ──────────
+# Extracts entities, decisions, technical facts, and error patterns
+# from every bot response. Zero-cost: pure regex/keyword extraction.
+# Ingests text via .ingest(), processes in background every 60 seconds.
+# Deduplicates via Jaccard overlap > 0.8 before storing.
+# This is a SUB-AGENT level component — supplements Gemma in code-related
+# knowledge capture. Primary pipeline (DeepSeek) is untouched.
+
+HARVEST_INTERVAL = 60  # Process pending texts every 60 seconds
+HARVEST_DEDUP_THRESHOLD = 0.8  # Jaccard overlap threshold for deduplication
+
+# Entity patterns (regex-based, zero LLM cost)
+ENTITY_PATTERNS = {
+    'version': re.compile(r'\bv\d+\.\d+(?:\.\d+)?\b', re.IGNORECASE),
+    'bug_id': re.compile(r'\bBUG-\d+\b', re.IGNORECASE),
+    'error_code': re.compile(r'\b(?:ERR|ERROR|WARN|FAIL)-?\d+\b', re.IGNORECASE),
+    'commit_hash': re.compile(r'\b[a-f0-9]{7,40}\b'),
+    'api_endpoint': re.compile(r'(?:GET|POST|PUT|DELETE|PATCH)\s+/[\w/\-{}]+'),
+    'model_name': re.compile(r'\b(?:grok|opus|codex|gemma|qwen|deepseek|r1|v3)\b', re.IGNORECASE),
+    'function_def': re.compile(r'\b(?:def|class|async def)\s+(\w+)'),
+    'config_value': re.compile(r'\b[A-Z_]{3,}=[\w\.\-]+'),
+    'ip_or_url': re.compile(r'https?://[\w\.\-/]+'),
+    'file_path': re.compile(r'[\w/]+\.(?:py|rs|js|ts|md|json|toml|yaml|sql)\b'),
+}
+
+# Decision markers
+DECISION_MARKERS = frozenset({
+    'decided', 'chose', 'selected', 'will use', 'switching to',
+    'replacing with', 'going with', 'opted for', 'settled on',
+    'approved', 'rejected', 'deprecated', 'upgraded to', 'downgraded to',
+    'migrated to', 'rolled back', 'deployed', 'reverted',
+})
+
+# Error pattern markers
+ERROR_MARKERS = frozenset({
+    'error', 'exception', 'traceback', 'failed', 'crash',
+    'timeout', 'refused', 'denied', 'broken', 'bug',
+    'fix:', 'fixed:', 'root cause', 'workaround',
+})
+
+
+class KnowledgeHarvester:
+    """Active knowledge extraction from bot responses. Zero LLM cost.
+
+    Responsibilities:
+      1. Ingest bot responses via .ingest() after every pipeline call
+      2. Extract entities (versions, commits, endpoints, model names, etc.)
+      3. Detect decisions (keyword markers in context)
+      4. Capture error patterns (error + fix pairs)
+      5. Deduplicate before storing (Jaccard > 0.8 = duplicate)
+      6. Process pending texts every HARVEST_INTERVAL seconds
+
+    This is a SUB-AGENT level component. It does NOT touch the primary
+    DeepSeek pipeline. It only reads completed responses.
+    """
+
+    def __init__(self, memory_instance):
+        self.memory = memory_instance
+        self.running = False
+        self.pending = deque(maxlen=200)  # Buffer: (text, source, channel_id, timestamp)
+        self.harvest_count = 0
+        self.total_entities = 0
+        self.total_decisions = 0
+        self.total_errors = 0
+        self.total_duplicates_skipped = 0
+        self.stats_log = deque(maxlen=100)  # Last 100 harvest cycles
+
+    def start(self):
+        """Start the background harvest daemon."""
+        if self.running:
+            return
+        self.running = True
+        thread = threading.Thread(target=self._harvest_loop, daemon=True, name="knowledge-harvester")
+        thread.start()
+        logger.info("[KH] Knowledge Harvester started (every 60s)")
+
+    def stop(self):
+        """Stop the harvest daemon."""
+        self.running = False
+        logger.info("[KH] Knowledge Harvester stopped")
+
+    def ingest(self, user_message, bot_response, source='discord', channel_id=None):
+        """Queue a conversation pair for harvesting. Called after every bot response."""
+        if not bot_response or len(bot_response.strip()) < 20:
+            return  # Skip trivially short responses
+        self.pending.append({
+            'user': user_message[:1000],
+            'bot': bot_response[:2000],
+            'source': source,
+            'channel_id': channel_id,
+            'timestamp': datetime.now().isoformat(),
+        })
+
+    def _harvest_loop(self):
+        """Main harvest loop — processes pending texts every HARVEST_INTERVAL."""
+        time.sleep(30)  # Wait 30s after startup
+        while self.running:
+            try:
+                stats = self._process_pending()
+                if stats['processed'] > 0:
+                    self.stats_log.append(stats)
+                    self.harvest_count += 1
+            except Exception as e:
+                logger.error(f"[KH] Harvest cycle failed: {e}", exc_info=True)
+            time.sleep(HARVEST_INTERVAL)
+
+    def _process_pending(self):
+        """Process all pending texts. Returns stats dict."""
+        stats = {
+            'timestamp': datetime.now().isoformat(),
+            'processed': 0,
+            'entities': 0,
+            'decisions': 0,
+            'errors': 0,
+            'duplicates_skipped': 0,
+        }
+
+        batch = []
+        while self.pending:
+            try:
+                batch.append(self.pending.popleft())
+            except IndexError:
+                break
+
+        for item in batch:
+            combined = f"{item['user']} {item['bot']}"
+            stats['processed'] += 1
+
+            # Extract entities
+            entities = self._extract_entities(item['bot'])
+            for ent_type, ent_value in entities:
+                keywords = f"{ent_type} {ent_value.lower()} {' '.join(item['user'].lower().split()[:5])}"
+                content = f"[{ent_type}] {ent_value} (context: {item['user'][:80]})"
+                if not self._is_duplicate(content, keywords):
+                    self.memory.store_knowledge('entity', content, keywords, 'harvester')
+                    stats['entities'] += 1
+                    self.total_entities += 1
+                else:
+                    stats['duplicates_skipped'] += 1
+                    self.total_duplicates_skipped += 1
+
+            # Extract decisions
+            decisions = self._extract_decisions(combined)
+            for decision_text in decisions:
+                keywords = ' '.join(decision_text.lower().split()[:10])
+                if not self._is_duplicate(decision_text, keywords):
+                    self.memory.store_knowledge('decision', decision_text[:500], keywords, 'harvester')
+                    # Also store in the decisions table
+                    try:
+                        with sqlite3.connect(self.memory.db_path) as conn:
+                            conn.execute(
+                                "INSERT INTO decisions (decision, reasoning, agent, context, created_at) "
+                                "VALUES (?, ?, ?, ?, ?)",
+                                (decision_text[:500], item['bot'][:200], 'harvester',
+                                 item['user'][:200], datetime.now().isoformat())
+                            )
+                    except Exception:
+                        pass  # Non-critical
+                    stats['decisions'] += 1
+                    self.total_decisions += 1
+                else:
+                    stats['duplicates_skipped'] += 1
+                    self.total_duplicates_skipped += 1
+
+            # Extract error patterns
+            errors = self._extract_error_patterns(combined)
+            for error_text in errors:
+                keywords = ' '.join(error_text.lower().split()[:10])
+                if not self._is_duplicate(error_text, keywords):
+                    self.memory.store_knowledge('error_pattern', error_text[:500], keywords, 'harvester')
+                    stats['errors'] += 1
+                    self.total_errors += 1
+                else:
+                    stats['duplicates_skipped'] += 1
+                    self.total_duplicates_skipped += 1
+
+        if stats['processed'] > 0:
+            logger.info(
+                f"[KH] Cycle #{self.harvest_count + 1}: processed={stats['processed']}, "
+                f"entities={stats['entities']}, decisions={stats['decisions']}, "
+                f"errors={stats['errors']}, dupes_skipped={stats['duplicates_skipped']}"
+            )
+
+        return stats
+
+    def _extract_entities(self, text):
+        """Extract named entities via regex patterns. Returns list of (type, value) tuples."""
+        entities = []
+        for ent_type, pattern in ENTITY_PATTERNS.items():
+            matches = pattern.findall(text)
+            for match in matches[:5]:  # Cap at 5 per type per response
+                if len(match) > 2:  # Skip trivially short matches
+                    entities.append((ent_type, match))
+        return entities
+
+    def _extract_decisions(self, text):
+        """Detect decision statements via keyword markers."""
+        decisions = []
+        sentences = re.split(r'[.!?\n]', text)
+        for sentence in sentences:
+            sentence_lower = sentence.lower().strip()
+            if len(sentence_lower) < 15:
+                continue
+            for marker in DECISION_MARKERS:
+                if marker in sentence_lower:
+                    decisions.append(sentence.strip()[:300])
+                    break  # One marker per sentence is enough
+        return decisions[:5]  # Cap at 5 decisions per conversation
+
+    def _extract_error_patterns(self, text):
+        """Detect error + fix pairs."""
+        errors = []
+        sentences = re.split(r'[.!?\n]', text)
+        for i, sentence in enumerate(sentences):
+            sentence_lower = sentence.lower().strip()
+            if len(sentence_lower) < 15:
+                continue
+            error_count = sum(1 for marker in ERROR_MARKERS if marker in sentence_lower)
+            if error_count >= 2:  # At least 2 error markers = likely error pattern
+                # Grab context: this sentence + next sentence (often contains the fix)
+                context = sentence.strip()
+                if i + 1 < len(sentences) and sentences[i + 1].strip():
+                    context += ' | ' + sentences[i + 1].strip()
+                errors.append(context[:400])
+        return errors[:3]  # Cap at 3 error patterns per conversation
+
+    def _is_duplicate(self, content, keywords):
+        """Check if this knowledge already exists (Jaccard overlap > threshold)."""
+        query_words = set(keywords.lower().split())
+        if not query_words:
+            return False
+        try:
+            with sqlite3.connect(self.memory.db_path) as conn:
+                conn.execute("PRAGMA busy_timeout=2000")
+                # Check last 50 entries in same category for overlap
+                rows = conn.execute(
+                    "SELECT keywords FROM knowledge WHERE agent = 'harvester' "
+                    "ORDER BY id DESC LIMIT 50"
+                ).fetchall()
+            for (existing_kw,) in rows:
+                existing_set = set(existing_kw.split())
+                if not existing_set:
+                    continue
+                intersection = len(query_words & existing_set)
+                union = len(query_words | existing_set)
+                jaccard = intersection / union if union > 0 else 0
+                if jaccard > HARVEST_DEDUP_THRESHOLD:
+                    return True
+            return False
+        except Exception:
+            return False  # If check fails, allow the insert
+
+    def get_status(self):
+        """Return current harvester status for /memory command."""
+        return {
+            'harvest_count': self.harvest_count,
+            'pending_items': len(self.pending),
+            'total_entities': self.total_entities,
+            'total_decisions': self.total_decisions,
+            'total_errors': self.total_errors,
+            'total_duplicates_skipped': self.total_duplicates_skipped,
+            'recent_stats': list(self.stats_log)[-5:] if self.stats_log else [],
+            'config': {
+                'interval_sec': HARVEST_INTERVAL,
+                'dedup_threshold': HARVEST_DEDUP_THRESHOLD,
+                'entity_patterns': len(ENTITY_PATTERNS),
+                'decision_markers': len(DECISION_MARKERS),
+            }
+        }
+
+
 # ─── T2 MEMORY AUDITOR (Lightweight Background Daemon) ───────
 # Watches memory tables for bloat. Prunes stale entries.
 # Runs every 30 minutes in a background thread. Lightweight — no model calls.
@@ -1706,6 +1977,9 @@ def api_chat():
         if not msg:
             return jsonify({'error': 'Empty message'}), 400
         result = run_pipeline(msg)
+        # Feed to Knowledge Harvester (API path)
+        if knowledge_harvester and knowledge_harvester.running:
+            knowledge_harvester.ingest(msg, result.get('response', ''), 'api', None)
         return jsonify(result)
     except Exception as e:
         logger.error(f"Chat error: {e}", exc_info=True)
@@ -1714,7 +1988,7 @@ def api_chat():
 
 @app.route('/health')
 def health():
-    return jsonify({'status': 'healthy', 'version': '5.5-memory', 'timestamp': datetime.now().isoformat()})
+    return jsonify({'status': 'healthy', 'version': '3.4-kh', 'timestamp': datetime.now().isoformat()})
 
 
 @app.route('/budget')
@@ -1725,6 +1999,14 @@ def budget_status():
 @app.route('/memory')
 def memory_stats():
     return jsonify(memory.stats())
+
+
+@app.route('/knowledge-harvester')
+def kh_status():
+    """Knowledge Harvester monitoring endpoint."""
+    status = knowledge_harvester.get_status() if knowledge_harvester else {'status': 'not_initialized'}
+    status['t2_auditor'] = t2_auditor.get_status() if t2_auditor else {'status': 'not_initialized'}
+    return jsonify(status)
 
 
 @app.route('/memory/search')
@@ -2142,6 +2424,10 @@ def start_discord_bot():
                     full_response
                 )
 
+                # ── KNOWLEDGE HARVESTING: Feed response to harvester ──
+                if knowledge_harvester and knowledge_harvester.running:
+                    knowledge_harvester.ingest(content, response_text, 'discord', channel_id)
+
                 # ── SLOP DETECTION: Background scan of bot output ──
                 slop_triggers = detect_slop(response_text)
                 if slop_triggers:
@@ -2220,11 +2506,16 @@ start_discord_bot()
 t2_auditor = T2MemoryAuditor(memory)
 t2_auditor.start()
 
+# Start Knowledge Harvester daemon
+knowledge_harvester = KnowledgeHarvester(memory)
+knowledge_harvester.start()
+
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
-    logger.info(f"Super Brain Dev Team v3.3 starting on :{port}")
+    logger.info(f"Super Brain Dev Team v3.4 starting on :{port}")
     logger.info(f"Models: Gemma + Grok + Codex + Opus + DeepSeek V3/R1 + Qwen 3")
     logger.info(f"Discord: {'enabled' if DISCORD_TOKEN else 'disabled (no token)'}")
     logger.info(f"T2 Auditor: active (30m cycle)")
+    logger.info(f"Knowledge Harvester: active (60s cycle)")
     app.run(host='0.0.0.0', port=port)
