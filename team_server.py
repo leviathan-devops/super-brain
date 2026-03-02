@@ -2009,6 +2009,28 @@ def kh_status():
     return jsonify(status)
 
 
+@app.route('/memory/purge-harvester', methods=['POST'])
+def purge_harvester_data():
+    """Admin endpoint: purge all harvester-generated knowledge entries.
+    Used after test cycles to clean synthetic data. Requires API key."""
+    auth = request.headers.get('Authorization', '')
+    if auth != f'Bearer {os.environ.get("LEVIATHAN_API_KEY", "leviathan-test-key-2026")}':
+        return jsonify({'error': 'Unauthorized'}), 401
+    try:
+        with sqlite3.connect(memory.db_path) as conn:
+            conn.execute("PRAGMA busy_timeout=5000")
+            k_deleted = conn.execute("DELETE FROM knowledge WHERE agent = 'harvester'").rowcount
+            d_deleted = conn.execute("DELETE FROM decisions WHERE agent = 'harvester'").rowcount
+        logger.info(f"[ADMIN] Purged harvester data: {k_deleted} knowledge + {d_deleted} decisions")
+        return jsonify({
+            'status': 'purged',
+            'knowledge_deleted': k_deleted,
+            'decisions_deleted': d_deleted,
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/memory/search')
 def memory_search():
     q = request.args.get('q', '')
