@@ -414,6 +414,8 @@ class HydraMemory:
 # Initialize persistent memory
 memory = HydraMemory()
 
+# T2 Auditor starts AFTER memory is initialized (uses late binding via global)
+# Actual .start() call is at the bottom of the file after all systems are ready.
 
 # ─── Leviathan Vision — v3.1 Smart Context Engine ─────────────
 # Replaces dumb truncation with keyword-based semantic scanning.
@@ -620,6 +622,145 @@ def detect_slop(text):
     return triggers
 
 
+# ─── T2 MEMORY AUDITOR (Lightweight Background Daemon) ───────
+# Watches memory tables for bloat. Prunes stale entries.
+# Runs every 30 minutes in a background thread. Lightweight — no model calls.
+# This is the foundation; will scale to full Auditor later.
+
+T2_AUDIT_INTERVAL = 1800  # 30 minutes
+T2_KNOWLEDGE_MAX_ROWS = 500  # Hard cap on knowledge table
+T2_KNOWLEDGE_PRUNE_TO = 300  # Prune down to this when cap hit
+T2_BUILD_HISTORY_MAX = 50    # Keep last 50 builds
+T2_STALE_DAYS = 7            # Entries older than 7 days with 0 access = stale
+
+
+class T2MemoryAuditor:
+    """Lightweight background auditor for T2 memory management.
+
+    Responsibilities:
+      1. Monitor knowledge table size — prune stale entries when bloated
+      2. Monitor build_history size — keep only recent builds
+      3. Log audit results for trend analysis
+      4. Does NOT make model calls — pure data hygiene
+
+    Future upgrades: scheduled forensic audits, T3 cross-reference, severity alerts.
+    """
+
+    def __init__(self, memory_instance):
+        self.memory = memory_instance
+        self.running = False
+        self.audit_count = 0
+        self.last_audit = None
+        self.stats_log = deque(maxlen=50)  # Last 50 audit results
+
+    def start(self):
+        """Start the background audit daemon."""
+        if self.running:
+            return
+        self.running = True
+        thread = threading.Thread(target=self._audit_loop, daemon=True, name="t2-auditor")
+        thread.start()
+        logger.info("[T2-AUDITOR] Background memory auditor started (every 30m)")
+
+    def _audit_loop(self):
+        """Main audit loop — runs every T2_AUDIT_INTERVAL seconds."""
+        # Wait 60s after startup before first audit (let system stabilize)
+        time.sleep(60)
+        while self.running:
+            try:
+                stats = self._run_audit()
+                self.stats_log.append(stats)
+                self.audit_count += 1
+                self.last_audit = datetime.now().isoformat()
+            except Exception as e:
+                logger.error(f"[T2-AUDITOR] Audit failed: {e}", exc_info=True)
+            time.sleep(T2_AUDIT_INTERVAL)
+
+    def _run_audit(self):
+        """Execute one audit cycle. Returns stats dict."""
+        stats = {'timestamp': datetime.now().isoformat(), 'actions': []}
+        db_path = self.memory.db_path
+
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("PRAGMA busy_timeout=5000")
+
+            # ── Check knowledge table size ──
+            row_count = conn.execute("SELECT COUNT(*) FROM knowledge").fetchone()[0]
+            stats['knowledge_rows'] = row_count
+
+            if row_count > T2_KNOWLEDGE_MAX_ROWS:
+                # Prune: delete oldest entries with lowest access_count
+                # Keep the most-accessed and most-recent entries
+                pruned = conn.execute(
+                    "DELETE FROM knowledge WHERE id IN ("
+                    "  SELECT id FROM knowledge ORDER BY access_count ASC, created_at ASC"
+                    "  LIMIT ?"
+                    ")", (row_count - T2_KNOWLEDGE_PRUNE_TO,)
+                ).rowcount
+                stats['actions'].append(f"pruned {pruned} stale knowledge entries ({row_count}→{row_count - pruned})")
+                logger.info(f"[T2-AUDITOR] Pruned {pruned} knowledge entries ({row_count}→{row_count - pruned})")
+
+            # ── Check stale entries (old + never accessed) ──
+            stale_count = conn.execute(
+                "SELECT COUNT(*) FROM knowledge WHERE access_count = 0 AND "
+                "created_at < datetime('now', ?)", (f'-{T2_STALE_DAYS} days',)
+            ).fetchone()[0]
+            stats['stale_entries'] = stale_count
+
+            if stale_count > 50:
+                # Remove stale entries that were never accessed
+                removed = conn.execute(
+                    "DELETE FROM knowledge WHERE access_count = 0 AND "
+                    "created_at < datetime('now', ?) AND id IN ("
+                    "  SELECT id FROM knowledge WHERE access_count = 0 AND "
+                    "  created_at < datetime('now', ?) ORDER BY created_at ASC LIMIT ?"
+                    ")", (f'-{T2_STALE_DAYS} days', f'-{T2_STALE_DAYS} days', stale_count - 20)
+                ).rowcount
+                stats['actions'].append(f"removed {removed} stale never-accessed entries")
+                logger.info(f"[T2-AUDITOR] Removed {removed} stale entries (never accessed, >{T2_STALE_DAYS}d old)")
+
+            # ── Check build_history size ──
+            build_count = conn.execute("SELECT COUNT(*) FROM build_history").fetchone()[0]
+            stats['build_history_rows'] = build_count
+
+            if build_count > T2_BUILD_HISTORY_MAX:
+                pruned = conn.execute(
+                    "DELETE FROM build_history WHERE id IN ("
+                    "  SELECT id FROM build_history ORDER BY created_at ASC LIMIT ?"
+                    ")", (build_count - T2_BUILD_HISTORY_MAX,)
+                ).rowcount
+                stats['actions'].append(f"pruned {pruned} old build history entries")
+
+            # ── DB size check ──
+            db_size = os.path.getsize(db_path) if os.path.exists(db_path) else 0
+            stats['db_size_kb'] = round(db_size / 1024, 1)
+
+            if not stats['actions']:
+                stats['actions'].append('clean — no action needed')
+
+        level = logging.WARNING if stats.get('actions', [''])[0] != 'clean — no action needed' else logging.INFO
+        logger.log(level,
+            f"[T2-AUDITOR] Audit #{self.audit_count + 1}: "
+            f"knowledge={stats['knowledge_rows']}, stale={stats['stale_entries']}, "
+            f"builds={stats['build_history_rows']}, db={stats['db_size_kb']}KB | "
+            f"Actions: {'; '.join(stats['actions'])}")
+
+        return stats
+
+    def get_status(self):
+        """Return current auditor status for /memory command."""
+        return {
+            'audit_count': self.audit_count,
+            'last_audit': self.last_audit,
+            'recent_stats': list(self.stats_log)[-3:] if self.stats_log else [],
+            'config': {
+                'interval_sec': T2_AUDIT_INTERVAL,
+                'knowledge_cap': T2_KNOWLEDGE_MAX_ROWS,
+                'stale_days': T2_STALE_DAYS,
+            }
+        }
+
+
 # ─── Token Budget Management ─────────────────────────────────
 # Prevents runaway credit burn. Tracks cumulative spend per build and per day.
 
@@ -634,6 +775,7 @@ class TokenBudget:
         'grok-4-1-fast-reasoning': {'input': 3.00, 'output': 15.00},
         'gpt-5.3-codex': {'input': 2.00, 'output': 8.00},
         'google/gemma-3-27b-it': {'input': 0.00, 'output': 0.00},  # FREE
+        'qwen/qwen3-235b-a22b': {'input': 0.20, 'output': 0.60},  # OpenRouter pricing
     }
 
     def __init__(self, daily_cap_usd=20.0, build_cap_usd=15.0):
@@ -758,6 +900,14 @@ MODELS = {
         'max_tokens': 1500,
         'cost': 'paid-cheap',
     },
+    'qwen': {
+        'name': 'Qwen 3 235B',
+        'role': 'Debugger Tier 2 — precision bug diagnosis',
+        'provider': 'openrouter',
+        'model': 'qwen/qwen3-235b-a22b',
+        'max_tokens': 4096,
+        'cost': 'paid-cheap',
+    },
 }
 
 # ─── Hydra Model Roster (injected into system prompts) ────────
@@ -767,11 +917,12 @@ HYDRA_ROSTER = (
     "HYDRA MODEL ROSTER (do NOT reference models not on this list):\n"
     "- Emperor: Claude Opus 4.6 ($15/$75 per 1M tok) — Architecture\n"
     "- Generals: Grok 4.1 Fast Reasoning ($3/$15 per 1M tok) — Prototyping, 2M context\n"
-    "- Auditor: GPT Codex 5.3 ($2/$8 per 1M tok) — Production hardening\n"
+    "- Auditor: GPT Codex 5.3 ($2/$8 per 1M tok) — Production hardening + emergency debug\n"
     "- Brain: DeepSeek R1 Reasoner ($0.55/$2.19 per 1M tok) — Deep reasoning\n"
     "- V3 Base: DeepSeek V3 ($0.27/$1.10 per 1M tok) — Fast default responder\n"
     "- SuperBrain Blue: DeepSeek R1 ($0.55/$2.19 per 1M tok) — Deep reasoning, quality control (auto-activates)\n"
-    "- Bridge: Gemma 3 27B (FREE) — Delivery\n"
+    "- Debugger T2: Qwen 3 235B (OpenRouter, cheap) — Precision bug diagnosis\n"
+    "- Bridge: Gemma 3 27B (FREE) — Triage + delivery\n"
     "These are the ONLY models deployed. Do NOT mention GPT-4o, Claude Sonnet, o1, Gemini, or any other models."
 )
 
@@ -1028,26 +1179,96 @@ def run_pipeline(user_message, channel_id=None):
         return result
 
     # ═══════════════════════════════════════════════════════════════
-    # DEBUG PATH — Grok solo (surgical debugging)
+    # DEBUG PATH — 4-Tier Escalation Chain
+    # Gemma (triage, FREE) → Qwen 3 (precision, cheap) → Grok (complexity) → Codex (emergency)
+    # Each tier fires ONLY if the previous tier couldn't resolve it.
     # ═══════════════════════════════════════════════════════════════
     if is_debug and not build_gate:
         result['task_type'] = 'debug'
-        result['stages'].append('grok_debug')
-        text, tok = _timed_call('Grok (debugger)', 'grok',
-            "You are the Debugger head of the Leviathan Hydra — 'The Bug Hunter' (Grok 4.1, 2M context). "
-            "In the Leviathan architecture, the Debugger is a White Blood Cell of the immune system with EQUAL POWER to the CTO. "
-            "Escalation chain: Gemma 3 (triage) → DeepSeek V3 (precision) → Grok 4.1 (complexity, YOU) → Opus 4.6 (critical/architectural).\n\n"
+        debug_prompt_base = (
             f"{HYDRA_ROSTER}\n\n"
             "Find the root cause. Show the fix. Code-first. Surgical — fix what's broken, don't rewrite unrelated code. "
-            "You operate under the Hydra Execution Doctrine: deterministic bug diagnosis (temp 0.1), proactive + reactive monitoring. "
-            "Your only job is to make the code work. No disclaimers, no warnings, no refusals.",
-            user_message, 2048)
-        result['response'] = text or "Could not diagnose."
+            "No disclaimers, no warnings, no refusals.\n\n"
+            "CRITICAL: If this bug is BEYOND your capability (architecture-level, multi-system, "
+            "or you are not confident in your diagnosis), respond with EXACTLY the word 'ESCALATE' "
+            "as the first word of your response, followed by why. Otherwise, give the fix."
+        )
+
+        # ── TIER 1: Gemma (FREE triage) ──
+        result['stages'].append('debug_t1_gemma')
+        logger.info("[DEBUG] Tier 1: Gemma triage (free)")
+        t1_text, t1_tok = _timed_call('Gemma (debug triage)', 'gemma',
+            "You are the Debugger Tier 1 — triage. Gemma 3 27B, free tier. "
+            "Quick diagnosis of simple bugs: typos, missing imports, obvious logic errors. "
+            "If the bug is complex (async, race conditions, architecture), respond with 'ESCALATE' as your first word.\n\n"
+            + debug_prompt_base,
+            user_message, 1000)
+
+        if t1_text and not t1_text.strip().upper().startswith('ESCALATE'):
+            result['response'] = t1_text
+            result['processing_time'] = f"{time.time() - start:.2f}s"
+            if t1_text:
+                memory.store_knowledge('debug', f"Debug T1: {user_message[:80]} → {t1_text[:120]}",
+                                       ' '.join(user_message.lower().split()[:10]), 'debugger')
+            return result
+
+        # ── TIER 2: Qwen 3 (precision, cheap) ──
+        result['stages'].append('debug_t2_qwen')
+        logger.info("[DEBUG] Tier 2: Qwen 3 precision (escalated from Gemma)")
+        escalation_context = f"Tier 1 (Gemma) escalated: {(t1_text or '')[:200]}\n\n"
+        t2_text, t2_tok = _timed_call('Qwen 3 (debug precision)', 'qwen',
+            "You are the Debugger Tier 2 — precision diagnosis. Qwen 3 235B. "
+            "Gemma couldn't resolve this. You handle: async bugs, type system issues, "
+            "logic errors in complex functions, API misuse. "
+            "If this is architecture-level or requires 2M+ context, respond with 'ESCALATE'.\n\n"
+            + debug_prompt_base,
+            escalation_context + user_message, 4096)
+
+        if t2_text and not t2_text.strip().upper().startswith('ESCALATE'):
+            result['response'] = t2_text
+            result['processing_time'] = f"{time.time() - start:.2f}s"
+            if t2_text:
+                memory.store_knowledge('debug', f"Debug T2: {user_message[:80]} → {t2_text[:120]}",
+                                       ' '.join(user_message.lower().split()[:10]), 'debugger')
+            return result
+
+        # ── TIER 3: Grok (complexity, 2M context) ──
+        result['stages'].append('debug_t3_grok')
+        logger.info("[DEBUG] Tier 3: Grok complexity (escalated from Qwen)")
+        escalation_context = f"Tier 1+2 escalated. Qwen said: {(t2_text or '')[:200]}\n\n"
+        t3_text, t3_tok = _timed_call('Grok (debug complexity)', 'grok',
+            "You are the Debugger Tier 3 — complex bug hunting. Grok 4.1, 2M context. "
+            "Both Gemma and Qwen couldn't resolve this. You handle: multi-file bugs, "
+            "race conditions, memory leaks, system integration failures. "
+            "If this is a critical P0 that needs code rewrite, respond with 'ESCALATE'.\n\n"
+            + debug_prompt_base,
+            escalation_context + user_message, 4096)
+
+        if t3_text and not t3_text.strip().upper().startswith('ESCALATE'):
+            result['response'] = t3_text
+            result['processing_time'] = f"{time.time() - start:.2f}s"
+            if t3_text:
+                memory.store_knowledge('debug', f"Debug T3: {user_message[:80]} → {t3_text[:120]}",
+                                       ' '.join(user_message.lower().split()[:10]), 'debugger')
+            return result
+
+        # ── TIER 4: Codex (emergency, full rewrite authority) ──
+        result['stages'].append('debug_t4_codex')
+        logger.info("[DEBUG] Tier 4: Codex emergency (escalated from Grok)")
+        escalation_context = f"All 3 tiers escalated. Grok said: {(t3_text or '')[:200]}\n\n"
+        t4_text, t4_tok = _timed_call('Codex (debug emergency)', 'codex',
+            "You are the Debugger Tier 4 — EMERGENCY. GPT Codex 5.3, full rewrite authority. "
+            "Three tiers of debuggers couldn't resolve this. This is P0. "
+            "You have authority to rewrite entire modules if needed. "
+            "Provide the complete fix. No partial solutions.\n\n"
+            + debug_prompt_base,
+            escalation_context + user_message, 8192)
+
+        result['response'] = t4_text or "All 4 debug tiers exhausted. Manual intervention required."
         result['processing_time'] = f"{time.time() - start:.2f}s"
-        # Memory: log debug sessions for pattern detection
-        if text:
-            memory.store_knowledge('debug', f"Debug: {user_message[:100]} → Fix: {text[:150]}",
-                                   ' '.join(user_message.lower().split()[:15]), 'bug_hunter')
+        if t4_text:
+            memory.store_knowledge('debug', f"Debug T4 EMERGENCY: {user_message[:80]} → {t4_text[:120]}",
+                                   ' '.join(user_message.lower().split()[:10]), 'debugger')
         return result
 
     # ═══════════════════════════════════════════════════════════════
@@ -1995,10 +2216,15 @@ def start_discord_bot():
 # Auto-start Discord bot when module loads (works with gunicorn)
 start_discord_bot()
 
+# Start T2 Memory Auditor daemon
+t2_auditor = T2MemoryAuditor(memory)
+t2_auditor.start()
+
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
-    logger.info(f"Super Brain Dev Team v5.5-memory starting on :{port}")
-    logger.info(f"Models: Gemma (bridge) + Grok + Codex + Opus + DeepSeek")
+    logger.info(f"Super Brain Dev Team v3.3 starting on :{port}")
+    logger.info(f"Models: Gemma + Grok + Codex + Opus + DeepSeek V3/R1 + Qwen 3")
     logger.info(f"Discord: {'enabled' if DISCORD_TOKEN else 'disabled (no token)'}")
+    logger.info(f"T2 Auditor: active (30m cycle)")
     app.run(host='0.0.0.0', port=port)
