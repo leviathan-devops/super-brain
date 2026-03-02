@@ -312,22 +312,23 @@ def call_model(model_key, system_prompt, user_message, max_tokens=None):
 
 executor = ThreadPoolExecutor(max_workers=5)
 
-# ─── BUILD GATE — STRICT KEYWORD CHECK ──────────────────────
-# Build pipeline ONLY triggers if "build", "deploy", or "create" appear
-# within the FIRST 10 TOKENS of the input. Everything else defaults to
-# Gemma → DeepSeek fast-path (cheap, low latency, no frontier model burn).
+# ─── BUILD GATE — SLASH COMMAND ONLY ─────────────────────────
+# Build pipeline ONLY triggers if the message starts with /build.
+# Everything else defaults to Gemma → DeepSeek fast-path (cheap, low latency).
 
-BUILD_GATE_KEYWORDS = ['build', 'deploy', 'create']
-
-# Secondary keywords — only checked AFTER DeepSeek confirms complex intent
+# Secondary keywords — only checked for debug routing
 DEBUG_KEYWORDS = ['debug', 'error', 'crash', 'trace', 'stacktrace', 'exception', 'broken', 'failing',
                   'diagnose', 'root cause', 'scan', 'bug', 'not working']
 
 
-def check_build_gate(msg):
-    """Returns True only if build/deploy/create appear in the first 10 tokens."""
-    first_10 = ' '.join(msg.split()[:10]).lower()
-    return any(kw in first_10 for kw in BUILD_GATE_KEYWORDS)
+def parse_build_command(msg):
+    """Check if message starts with /build. Returns (is_build, cleaned_message)."""
+    stripped = msg.strip()
+    if stripped.lower().startswith('/build'):
+        # Strip the /build prefix and return the actual instruction
+        remainder = stripped[6:].strip()
+        return True, remainder if remainder else stripped
+    return False, stripped
 
 
 def check_debug_keywords(msg):
@@ -346,13 +347,13 @@ def _track(result, model_name, text, tokens):
 
 def run_pipeline(user_message):
     """
-    v5.2 Workflow — Credit-Conservative Staged Pipeline.
+    v5.3 Workflow — Credit-Conservative Staged Pipeline.
 
     DEFAULT PATH (99% of messages):
       Gemma (FREE) → DeepSeek Chat V3 (cheap) → Gemma (FREE) → user
       Total cost: ~$0.001 per message. Low latency.
 
-    BUILD PATH (only if build/deploy/create in first 10 tokens):
+    BUILD PATH (only if message starts with /build):
       Gemma (FREE intake) → DeepSeek R1 (master prompt) → Opus (architecture)
       → Grok x2 parallel (prototype) → Codex x2 parallel (production hardening)
       → DeepSeek R1 (verification) → [loop if needed] → Gemma (FREE delivery)
@@ -361,7 +362,7 @@ def run_pipeline(user_message):
       Gemma → Grok (2M context, surgical fix) → Gemma
     """
     start = time.time()
-    build_gate = check_build_gate(user_message)
+    build_gate, user_message = parse_build_command(user_message)
     is_debug = check_debug_keywords(user_message)
     words = len(user_message.split())
 
@@ -692,7 +693,7 @@ def api_chat():
 
 @app.route('/health')
 def health():
-    return jsonify({'status': 'healthy', 'version': '5.2-gated', 'timestamp': datetime.now().isoformat()})
+    return jsonify({'status': 'healthy', 'version': '5.3-slash', 'timestamp': datetime.now().isoformat()})
 
 
 @app.route('/budget')
@@ -703,7 +704,7 @@ def budget_status():
 @app.route('/status')
 def status():
     return jsonify({
-        'version': '5.2-gated',
+        'version': '5.3-slash',
         'architecture': 'Gemma bridge + paid model execution',
         'models': {k: {'name': v['name'], 'role': v['role'], 'cost': v['cost']} for k, v in MODELS.items()},
         'api_keys': {k: bool(v) for k, v in API_KEYS.items()},
@@ -741,11 +742,11 @@ h1{font-size:20px;background:linear-gradient(135deg,#00d4ff,#7c3aed);-webkit-bac
 <body>
 <header>
 <h1>Leviathan Dev Team</h1>
-<div class="sub">Gemma 3 (bridge) · Grok · Codex · Opus · DeepSeek</div>
+<div class="sub">Gemma 3 (bridge) · Grok · Codex · Opus · DeepSeek &nbsp;|&nbsp; <span style="color:#7c3aed">/build</span> to activate full pipeline</div>
 </header>
 <div id="msgs"></div>
 <div class="bar">
-<input id="inp" placeholder="Talk to your dev team..." autocomplete="off">
+<input id="inp" placeholder="Chat normally, or type /build to activate the full dev pipeline..." autocomplete="off">
 <button id="btn" onclick="send()">Send</button>
 </div>
 <script>
@@ -908,7 +909,7 @@ start_discord_bot()
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
-    logger.info(f"Super Brain Dev Team v5.2 starting on :{port}")
+    logger.info(f"Super Brain Dev Team v5.3 starting on :{port}")
     logger.info(f"Models: Gemma (bridge) + Grok + Codex + Opus + DeepSeek")
     logger.info(f"Discord: {'enabled' if DISCORD_TOKEN else 'disabled (no token)'}")
     app.run(host='0.0.0.0', port=port)
