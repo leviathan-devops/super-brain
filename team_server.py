@@ -1488,6 +1488,67 @@ def start_discord_bot():
             logger.error(f"[MEMORY] Discord command error: {e}", exc_info=True)
             await interaction.followup.send(f"Memory error: {str(e)[:200]}")
 
+    # ── /cost slash command (project cost + time estimates) ──
+    @tree.command(name="cost", description="Estimate API cost and build time for a project idea", guild=target_guild)
+    @discord.app_commands.describe(idea="Describe what you want to build — the system will estimate cost and time")
+    async def cost_command(interaction: discord.Interaction, idea: str):
+        await interaction.response.defer()
+        try:
+            # Use DeepSeek Chat (cheapest) to analyze the idea and estimate stages
+            # Then apply REAL TokenBudget.COST_PER_M pricing to the estimate
+            cost_prompt = (
+                "You are the Leviathan Hydra's cost estimation engine. "
+                "The user wants to estimate the API cost and build time for a project idea. "
+                "You MUST use ONLY these REAL model prices (per 1M tokens):\n"
+                "- DeepSeek V3 (chat, fast path): $0.27 input / $1.10 output\n"
+                "- DeepSeek R1 (reasoning): $0.55 input / $2.19 output\n"
+                "- Claude Opus 4.6 (architecture): $15.00 input / $75.00 output\n"
+                "- Grok 4.1 (prototyping, 2M context): $3.00 input / $15.00 output\n"
+                "- GPT Codex 5.3 (hardening): $2.00 input / $8.00 output\n"
+                "- Gemma 3 27B (delivery): FREE\n\n"
+                "The ACTUAL build pipeline stages are:\n"
+                "1. Brain (R1): Master prompt generation — 1 call, ~3K in/2K out\n"
+                "2. Emperor (Opus): Architecture design — 1-2 calls, ~5K in/4K out each\n"
+                "3. Generals (Grok x2 parallel): Rapid prototype — 2-4 calls, ~4K in/3K out each\n"
+                "4. Auditor (Codex x2 parallel): Production hardening — 2-4 calls, ~4K in/2K out each\n"
+                "5. Brain (R1): Verification — 1-3 calls, ~4K in/2K out each\n"
+                "6. Fix loop: 0-2 rounds of stages 3-5 if verification fails\n"
+                "7. Bridge (Gemma): Delivery — FREE\n\n"
+                "For CHAT-ONLY tasks (no /build): 1 call to DeepSeek V3, ~3K in/1.5K out = $0.002\n\n"
+                "RULES:\n"
+                "- Be PRECISE with token counts and costs. Show the math.\n"
+                "- Estimate WALL-CLOCK TIME based on: R1 ~15-30s/call, Opus ~20-40s/call, Grok ~10-20s/call, Codex ~10-15s/call\n"
+                "- Parallel stages run simultaneously (Grok x2 = time of 1, not 2)\n"
+                "- If the project needs multiple build cycles, estimate each cycle separately\n"
+                "- Give a LOW estimate (best case) and HIGH estimate (worst case with fix loops)\n"
+                "- Format the output as a clean table. Include: Stage, Model, Calls, Tokens, Cost, Time\n"
+                "- End with TOTAL COST RANGE and TOTAL TIME RANGE\n"
+                "- Do NOT fabricate win rates, returns, or performance claims. Cost/time ONLY.\n"
+                "- Do NOT use blended rates. Calculate each model separately.\n"
+            )
+
+            loop = asyncio.get_event_loop()
+            text, tok = await loop.run_in_executor(
+                None, call_model, 'deepseek_chat', cost_prompt, f"Estimate cost and time for: {idea}", 2000
+            )
+
+            if text:
+                # Add actual API cost of this estimation call
+                est_cost = budget.estimate_cost('deepseek-chat', tok.get('input', 3000) if isinstance(tok, dict) else 3000,
+                                                 tok.get('output', 1500) if isinstance(tok, dict) else 1500)
+                footer = f"\n\n_This estimate cost ${est_cost:.4f} to generate._"
+                footer += f"\n-# DeepSeek V3 (cost engine) · /cost command"
+                await _send_response(
+                    interaction.followup.send,
+                    interaction.followup.send,
+                    text + footer
+                )
+            else:
+                await interaction.followup.send("Cost estimation failed. Try again.")
+        except Exception as e:
+            logger.error(f"[COST] Error: {e}", exc_info=True)
+            await interaction.followup.send(f"Cost estimation error: {str(e)[:200]}")
+
     # ── /wipe slash command (admin-only channel purge) ───────
     @tree.command(name="wipe", description="Delete all messages in this channel (Admin only)", guild=target_guild)
     @discord.app_commands.checks.has_permissions(administrator=True)
