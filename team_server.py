@@ -31,7 +31,9 @@ import time
 import re
 import logging
 import asyncio
-from datetime import datetime
+import sqlite3
+import hashlib
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import requests
@@ -42,6 +44,366 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 app.config['JSON_SORT_KEYS'] = False
+
+
+# ─── PERSISTENT MEMORY — 4-Layer Hydra Brain ────────────────────
+# Adapted from Vadim Strizheus' pattern. Leviathan twist: token-efficient.
+# Layer 1: SQLite knowledge DB (semantic search via keyword overlap, not vectors — zero deps)
+# Layer 2: Per-agent daily .md log files (agent writes after, reads before)
+# Layer 3: Shared brain JSON files (cross-agent context passing)
+# Layer 4: Startup injection (compact context loaded before every pipeline call)
+#
+# KEY DIFFERENCE from raw log dumps: we inject MAX 300 tokens of context per call.
+# Hot memory only. No changelog bloat. Follows Leviathan v2.5 lesson: 93% token reduction.
+
+MEMORY_DIR = os.environ.get('HYDRA_MEMORY_DIR', '/data/hydra-memory')
+MEMORY_DB = os.path.join(MEMORY_DIR, 'hydra-brain.db')
+
+# Agent names matching Hydra heads
+HYDRA_AGENTS = ['emperor', 'generals', 'thinker', 'auditor', 'bug_hunter', 'bridge']
+
+
+class HydraMemory:
+    """Persistent memory for the Leviathan Hydra dev team.
+
+    4 layers:
+      1. SQLite knowledge store (facts, decisions, build results)
+      2. Per-agent daily logs (what each head did)
+      3. Shared brain files (cross-agent handoffs, build context)
+      4. Startup context builder (injects compact memory into prompts)
+    """
+
+    def __init__(self, memory_dir=MEMORY_DIR, db_path=MEMORY_DB):
+        self.memory_dir = memory_dir
+        self.db_path = db_path
+        self.lock = threading.Lock()
+        self._ensure_dirs()
+        self._init_db()
+        logger.info(f"[MEMORY] HydraMemory initialized at {memory_dir}")
+
+    def _ensure_dirs(self):
+        """Create memory directory structure."""
+        os.makedirs(self.memory_dir, exist_ok=True)
+        # Per-agent log directories
+        for agent in HYDRA_AGENTS:
+            os.makedirs(os.path.join(self.memory_dir, 'agents', agent), exist_ok=True)
+        # Shared brain directory
+        os.makedirs(os.path.join(self.memory_dir, 'shared-brain'), exist_ok=True)
+
+    def _init_db(self):
+        """Initialize SQLite knowledge database."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")  # Leviathan standard: WAL for concurrent reads
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS knowledge (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    category TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    keywords TEXT NOT NULL,
+                    agent TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    access_count INTEGER DEFAULT 0,
+                    last_accessed TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_knowledge_category ON knowledge(category);
+                CREATE INDEX IF NOT EXISTS idx_knowledge_keywords ON knowledge(keywords);
+                CREATE INDEX IF NOT EXISTS idx_knowledge_agent ON knowledge(agent);
+
+                CREATE TABLE IF NOT EXISTS build_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task TEXT NOT NULL,
+                    result TEXT NOT NULL,
+                    architecture_summary TEXT,
+                    models_used TEXT,
+                    tokens_used INTEGER DEFAULT 0,
+                    cost_usd REAL DEFAULT 0.0,
+                    duration_secs REAL DEFAULT 0.0,
+                    status TEXT DEFAULT 'completed',
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS decisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    decision TEXT NOT NULL,
+                    reasoning TEXT,
+                    agent TEXT NOT NULL,
+                    context TEXT,
+                    created_at TEXT NOT NULL
+                );
+            """)
+            logger.info("[MEMORY] SQLite knowledge DB ready")
+
+    # ── Layer 1: Knowledge Store ──────────────────────────────
+
+    def store_knowledge(self, category, content, keywords, agent='system'):
+        """Store a fact/insight in the knowledge DB."""
+        if not content or not content.strip():
+            return
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO knowledge (category, content, keywords, agent, created_at) VALUES (?, ?, ?, ?, ?)",
+                (category, content[:2000], keywords.lower(), agent, datetime.now().isoformat())
+            )
+
+    def search_knowledge(self, query, limit=5):
+        """Search knowledge by keyword overlap (lightweight semantic search — no vector deps)."""
+        query_words = set(query.lower().split())
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT id, category, content, keywords, agent, created_at FROM knowledge ORDER BY id DESC LIMIT 200"
+            ).fetchall()
+
+        # Score by keyword overlap
+        scored = []
+        for row in rows:
+            kw_set = set(row[3].split())
+            overlap = len(query_words & kw_set)
+            if overlap > 0:
+                scored.append((overlap, row))
+
+        scored.sort(key=lambda x: -x[0])
+        results = []
+        for score, row in scored[:limit]:
+            results.append({
+                'id': row[0], 'category': row[1], 'content': row[2],
+                'keywords': row[3], 'agent': row[4], 'created_at': row[5],
+                'relevance': score,
+            })
+            # Bump access count
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    "UPDATE knowledge SET access_count = access_count + 1, last_accessed = ? WHERE id = ?",
+                    (datetime.now().isoformat(), row[0])
+                )
+        return results
+
+    def store_build(self, task, result_summary, arch_summary=None,
+                    models_used=None, tokens=0, cost=0.0, duration=0.0, status='completed'):
+        """Log a build to persistent history."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO build_history (task, result, architecture_summary, models_used, tokens_used, cost_usd, duration_secs, status, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (task[:500], result_summary[:2000], (arch_summary or '')[:1000],
+                 json.dumps(models_used or []), tokens, cost, duration, status,
+                 datetime.now().isoformat())
+            )
+
+    def get_recent_builds(self, limit=3):
+        """Get the most recent builds."""
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT task, result, status, cost_usd, duration_secs, created_at FROM build_history ORDER BY id DESC LIMIT ?",
+                (limit,)
+            ).fetchall()
+        return [{'task': r[0], 'result': r[1], 'status': r[2],
+                 'cost': r[3], 'duration': r[4], 'created_at': r[5]} for r in rows]
+
+    def store_decision(self, decision, reasoning=None, agent='system', context=None):
+        """Log an architectural or routing decision."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO decisions (decision, reasoning, agent, context, created_at) VALUES (?, ?, ?, ?, ?)",
+                (decision[:500], (reasoning or '')[:1000], agent, (context or '')[:500],
+                 datetime.now().isoformat())
+            )
+
+    # ── Layer 2: Per-Agent Daily Logs ─────────────────────────
+
+    def _agent_log_path(self, agent):
+        """Get today's log file path for an agent."""
+        today = datetime.now().strftime('%Y-%m-%d')
+        return os.path.join(self.memory_dir, 'agents', agent, f'{today}.md')
+
+    def write_agent_log(self, agent, entry):
+        """Append to an agent's daily log."""
+        if agent not in HYDRA_AGENTS:
+            agent = 'generals'  # Default
+        path = self._agent_log_path(agent)
+        timestamp = datetime.now().strftime('%H:%M:%S')
+        with self.lock:
+            with open(path, 'a') as f:
+                f.write(f"\n## {timestamp}\n{entry}\n")
+
+    def read_agent_recent_logs(self, agent, days=2):
+        """Read an agent's last N days of logs (compact — for startup injection)."""
+        if agent not in HYDRA_AGENTS:
+            agent = 'generals'
+        entries = []
+        for i in range(days):
+            day = (datetime.now() - timedelta(days=i)).strftime('%Y-%m-%d')
+            path = os.path.join(self.memory_dir, 'agents', agent, f'{day}.md')
+            if os.path.exists(path):
+                try:
+                    with open(path, 'r') as f:
+                        text = f.read()
+                    # Only take last 500 chars per day to keep it token-efficient
+                    if len(text) > 500:
+                        text = f"...(truncated)...\n{text[-500:]}"
+                    entries.append(f"[{day}]\n{text}")
+                except Exception:
+                    pass
+        return '\n'.join(entries)
+
+    # ── Layer 3: Shared Brain Files ───────────────────────────
+
+    def _brain_path(self, filename):
+        return os.path.join(self.memory_dir, 'shared-brain', filename)
+
+    def write_shared_brain(self, filename, data):
+        """Write to a shared brain JSON file."""
+        path = self._brain_path(filename)
+        with self.lock:
+            # Merge with existing if it's a dict
+            existing = {}
+            if os.path.exists(path):
+                try:
+                    with open(path, 'r') as f:
+                        existing = json.load(f)
+                except Exception:
+                    existing = {}
+
+            if isinstance(existing, dict) and isinstance(data, dict):
+                existing.update(data)
+                data = existing
+
+            with open(path, 'w') as f:
+                json.dump(data, f, indent=2, default=str)
+
+    def read_shared_brain(self, filename):
+        """Read a shared brain JSON file."""
+        path = self._brain_path(filename)
+        if not os.path.exists(path):
+            return {}
+        try:
+            with open(path, 'r') as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    # ── Layer 4: Startup Context Builder ──────────────────────
+    # This is the critical piece: build a COMPACT context string
+    # that gets injected into system prompts. Max ~300 tokens.
+
+    def build_context_injection(self, agent_name, task_hint=''):
+        """Build a compact context string for prompt injection.
+        Max ~300 tokens. Hot memory only — no bloat."""
+        parts = []
+
+        # Recent builds (1-liner each)
+        builds = self.get_recent_builds(limit=3)
+        if builds:
+            build_lines = []
+            for b in builds:
+                status_icon = '✓' if b['status'] == 'completed' else '✗'
+                build_lines.append(f"  {status_icon} {b['task'][:80]} ({b['created_at'][:10]})")
+            parts.append("RECENT BUILDS:\n" + '\n'.join(build_lines))
+
+        # Relevant knowledge (if task hint provided)
+        if task_hint:
+            knowledge = self.search_knowledge(task_hint, limit=3)
+            if knowledge:
+                kn_lines = [f"  - [{k['category']}] {k['content'][:100]}" for k in knowledge]
+                parts.append("RELEVANT KNOWLEDGE:\n" + '\n'.join(kn_lines))
+
+        # Agent's recent activity (compact)
+        agent_key = self._resolve_agent(agent_name)
+        recent = self.read_agent_recent_logs(agent_key, days=1)
+        if recent and len(recent.strip()) > 10:
+            # Take only last 200 chars
+            snippet = recent.strip()[-200:]
+            parts.append(f"YOUR RECENT ACTIVITY:\n  {snippet}")
+
+        # Shared brain: last build context
+        build_ctx = self.read_shared_brain('last-build-context.json')
+        if build_ctx and build_ctx.get('task'):
+            parts.append(f"LAST BUILD: {build_ctx.get('task', '')[:80]} → {build_ctx.get('status', 'unknown')}")
+
+        if not parts:
+            return ''
+
+        context = "── HYDRA PERSISTENT MEMORY ──\n" + '\n'.join(parts) + "\n── END MEMORY ──"
+
+        # Hard cap: 1500 chars (~300 tokens). Truncate if needed.
+        if len(context) > 1500:
+            context = context[:1490] + "\n..."
+
+        return context
+
+    def _resolve_agent(self, agent_name):
+        """Map model/label names to agent keys."""
+        name = agent_name.lower()
+        if 'opus' in name or 'emperor' in name or 'cto' in name:
+            return 'emperor'
+        if 'grok' in name or 'general' in name:
+            return 'generals'
+        if 'deepseek' in name or 'r1' in name or 'thinker' in name or 'brain' in name:
+            return 'thinker'
+        if 'codex' in name or 'auditor' in name:
+            return 'auditor'
+        if 'debug' in name or 'bug' in name:
+            return 'bug_hunter'
+        if 'gemma' in name or 'bridge' in name:
+            return 'bridge'
+        return 'generals'  # Default
+
+    # ── Memory Stats ──────────────────────────────────────────
+
+    def stats(self):
+        """Return memory system stats."""
+        with sqlite3.connect(self.db_path) as conn:
+            knowledge_count = conn.execute("SELECT COUNT(*) FROM knowledge").fetchone()[0]
+            build_count = conn.execute("SELECT COUNT(*) FROM build_history").fetchone()[0]
+            decision_count = conn.execute("SELECT COUNT(*) FROM decisions").fetchone()[0]
+
+        # Count agent log files
+        log_count = 0
+        for agent in HYDRA_AGENTS:
+            agent_dir = os.path.join(self.memory_dir, 'agents', agent)
+            if os.path.exists(agent_dir):
+                log_count += len([f for f in os.listdir(agent_dir) if f.endswith('.md')])
+
+        # Count shared brain files
+        brain_dir = os.path.join(self.memory_dir, 'shared-brain')
+        brain_count = len([f for f in os.listdir(brain_dir) if f.endswith('.json')]) if os.path.exists(brain_dir) else 0
+
+        return {
+            'knowledge_entries': knowledge_count,
+            'builds_logged': build_count,
+            'decisions_logged': decision_count,
+            'agent_log_files': log_count,
+            'shared_brain_files': brain_count,
+            'memory_dir': self.memory_dir,
+            'db_path': self.db_path,
+        }
+
+    # ── Pruning (cold tier cleanup) ───────────────────────────
+
+    def prune_old_logs(self, days_to_keep=30):
+        """Delete agent logs older than N days. Cold tier → gone."""
+        cutoff = datetime.now() - timedelta(days=days_to_keep)
+        pruned = 0
+        for agent in HYDRA_AGENTS:
+            agent_dir = os.path.join(self.memory_dir, 'agents', agent)
+            if not os.path.exists(agent_dir):
+                continue
+            for f in os.listdir(agent_dir):
+                if f.endswith('.md'):
+                    try:
+                        file_date = datetime.strptime(f.replace('.md', ''), '%Y-%m-%d')
+                        if file_date < cutoff:
+                            os.remove(os.path.join(agent_dir, f))
+                            pruned += 1
+                    except ValueError:
+                        pass
+        if pruned:
+            logger.info(f"[MEMORY] Pruned {pruned} old agent log files (>{days_to_keep} days)")
+        return pruned
+
+
+# Initialize persistent memory
+memory = HydraMemory()
 
 # ─── Token Budget Management ─────────────────────────────────
 # Prevents runaway credit burn. Tracks cumulative spend per build and per day.
@@ -380,7 +742,13 @@ def run_pipeline(user_message):
     }
 
     def _timed_call(label, model_key, system_prompt, user_msg, max_tok=None):
-        """Call a model and record timing + token telemetry."""
+        """Call a model and record timing + token telemetry.
+        Injects persistent memory context into system prompt (Layer 4: startup injection)."""
+        # Layer 4: Inject compact memory context before the call
+        mem_context = memory.build_context_injection(label, user_message[:200])
+        if mem_context:
+            system_prompt = f"{system_prompt}\n\n{mem_context}"
+
         t0 = time.time()
         text, tok = call_model(model_key, system_prompt, user_msg, max_tok)
         elapsed = time.time() - t0
@@ -394,6 +762,14 @@ def run_pipeline(user_message):
             'preview': (text[:150] + '...') if text and len(text) > 150 else (text or 'FAILED'),
         })
         logger.info(f"[PIPELINE] {label}: {elapsed:.1f}s, {len(text) if text else 0} chars")
+
+        # Layer 2: Write to agent's daily log after the call
+        agent_key = memory._resolve_agent(label)
+        memory.write_agent_log(agent_key,
+            f"**{label}** | {MODELS[model_key]['model']} | {elapsed:.1f}s | {len(text) if text else 0} chars\n"
+            f"Task: {user_message[:100]}...\n"
+            f"Output preview: {(text[:200] if text else 'FAILED')}")
+
         return text, tok
 
     # ═══════════════════════════════════════════════════════════════
@@ -414,6 +790,10 @@ def run_pipeline(user_message):
             user_message, 2048)
         result['response'] = text or "Failed to process large input."
         result['processing_time'] = f"{time.time() - start:.2f}s"
+        # Memory: log large input processing
+        if text:
+            memory.store_knowledge('ingest', f"Large input processed: {user_message[:100]}",
+                                   ' '.join(user_message.lower().split()[:15]), 'generals')
         return result
 
     # ═══════════════════════════════════════════════════════════════
@@ -432,6 +812,10 @@ def run_pipeline(user_message):
             user_message, 2048)
         result['response'] = text or "Could not diagnose."
         result['processing_time'] = f"{time.time() - start:.2f}s"
+        # Memory: log debug sessions for pattern detection
+        if text:
+            memory.store_knowledge('debug', f"Debug: {user_message[:100]} → Fix: {text[:150]}",
+                                   ' '.join(user_message.lower().split()[:15]), 'bug_hunter')
         return result
 
     # ═══════════════════════════════════════════════════════════════
@@ -738,6 +1122,40 @@ def run_pipeline(user_message):
         else:
             break  # Either approved or max rounds hit
 
+    # ── MEMORY: Log build to persistent storage ──
+    total_tokens = result['tokens']['input'] + result['tokens']['output']
+    build_cost = budget.current_build_spend
+    build_duration = time.time() - start
+    memory.store_build(
+        task=user_message[:500],
+        result_summary=(production_text[:500] if production_text else 'No output'),
+        arch_summary=(final_arch[:300] if final_arch else None),
+        models_used=result.get('models_used', []),
+        tokens=total_tokens,
+        cost=build_cost,
+        duration=build_duration,
+        status='approved' if verify_text and 'APPROVED' in (verify_text or '').upper() else 'completed',
+    )
+    # Shared brain: update last build context for cross-session memory
+    memory.write_shared_brain('last-build-context.json', {
+        'task': user_message[:200],
+        'status': 'approved' if verify_text and 'APPROVED' in (verify_text or '').upper() else 'completed',
+        'models_used': result.get('models_used', []),
+        'tokens': total_tokens,
+        'cost_usd': round(build_cost, 4),
+        'duration_secs': round(build_duration, 1),
+        'timestamp': datetime.now().isoformat(),
+    })
+    # Store architectural decisions as knowledge
+    if final_arch:
+        memory.store_knowledge(
+            category='architecture',
+            content=f"Build: {user_message[:100]}. Architecture: {final_arch[:300]}",
+            keywords=' '.join(user_message.lower().split()[:20]),
+            agent='emperor',
+        )
+    logger.info(f"[MEMORY] Build logged: {total_tokens} tokens, ${build_cost:.4f}, {build_duration:.1f}s")
+
     # ── STAGE 6: Gemma presents to user (FREE) ──
     result['stages'].append('delivery')
     logger.info("[BUILD] Stage 6: Delivery (Gemma)")
@@ -785,7 +1203,7 @@ def api_chat():
 
 @app.route('/health')
 def health():
-    return jsonify({'status': 'healthy', 'version': '5.4-hydra', 'timestamp': datetime.now().isoformat()})
+    return jsonify({'status': 'healthy', 'version': '5.5-memory', 'timestamp': datetime.now().isoformat()})
 
 
 @app.route('/budget')
@@ -793,10 +1211,30 @@ def budget_status():
     return jsonify(budget.status())
 
 
+@app.route('/memory')
+def memory_stats():
+    return jsonify(memory.stats())
+
+
+@app.route('/memory/search')
+def memory_search():
+    q = request.args.get('q', '')
+    if not q:
+        return jsonify({'error': 'Missing ?q= parameter'}), 400
+    results = memory.search_knowledge(q, limit=10)
+    return jsonify({'query': q, 'results': results})
+
+
+@app.route('/memory/builds')
+def memory_builds():
+    limit = int(request.args.get('limit', 10))
+    return jsonify(memory.get_recent_builds(limit=limit))
+
+
 @app.route('/status')
 def status():
     return jsonify({
-        'version': '5.4-hydra',
+        'version': '5.5-memory',
         'architecture': 'Leviathan Hydra — parallel multi-model execution',
         'models': {k: {'name': v['name'], 'role': v['role'], 'cost': v['cost']} for k, v in MODELS.items()},
         'api_keys': {k: bool(v) for k, v in API_KEYS.items()},
@@ -834,7 +1272,7 @@ h1{font-size:20px;background:linear-gradient(135deg,#00d4ff,#7c3aed);-webkit-bac
 <body>
 <header>
 <h1>Leviathan Dev Team</h1>
-<div class="sub">Leviathan Hydra v5.4 · Emperor (Opus) · Generals (Grok) · Thinker (DeepSeek R1) · Auditor (Codex) · Bridge (Gemma) &nbsp;|&nbsp; <span style="color:#7c3aed">/build</span> to unleash the Hydra</div>
+<div class="sub">Leviathan Hydra v5.5 · Emperor (Opus) · Generals (Grok) · Thinker (DeepSeek R1) · Auditor (Codex) · Bridge (Gemma) &nbsp;|&nbsp; <span style="color:#7c3aed">/build</span> to unleash the Hydra</div>
 </header>
 <div id="msgs"></div>
 <div class="bar">
@@ -937,6 +1375,44 @@ def start_discord_bot():
             await send_func(chunks[0])
             for chunk in chunks[1:]:
                 await followup_func(chunk)
+
+    # ── /memory slash command (inspect Hydra memory) ─────────
+    @tree.command(name="memory", description="View the Hydra's persistent memory stats and recent builds", guild=target_guild)
+    @discord.app_commands.describe(query="Optional: search memory for a keyword")
+    async def memory_command(interaction: discord.Interaction, query: str = None):
+        await interaction.response.defer()
+        try:
+            if query:
+                # Search mode
+                results = memory.search_knowledge(query, limit=5)
+                if results:
+                    lines = [f"**Memory Search: '{query}'**\n"]
+                    for r in results:
+                        lines.append(f"• [{r['category']}] {r['content'][:150]} _(by {r['agent']}, {r['created_at'][:10]})_")
+                    await interaction.followup.send('\n'.join(lines))
+                else:
+                    await interaction.followup.send(f"No memory entries found for '{query}'.")
+            else:
+                # Stats mode
+                stats = memory.stats()
+                builds = memory.get_recent_builds(limit=3)
+                msg = (
+                    f"**🧠 Hydra Persistent Memory**\n"
+                    f"Knowledge entries: **{stats['knowledge_entries']}**\n"
+                    f"Builds logged: **{stats['builds_logged']}**\n"
+                    f"Decisions logged: **{stats['decisions_logged']}**\n"
+                    f"Agent log files: **{stats['agent_log_files']}**\n"
+                    f"Shared brain files: **{stats['shared_brain_files']}**\n"
+                )
+                if builds:
+                    msg += "\n**Recent Builds:**\n"
+                    for b in builds:
+                        icon = '✅' if b['status'] in ('completed', 'approved') else '❌'
+                        msg += f"{icon} {b['task'][:80]} — ${b['cost']:.4f} — {b['created_at'][:10]}\n"
+                await interaction.followup.send(msg)
+        except Exception as e:
+            logger.error(f"[MEMORY] Discord command error: {e}", exc_info=True)
+            await interaction.followup.send(f"Memory error: {str(e)[:200]}")
 
     # ── /wipe slash command (admin-only channel purge) ───────
     @tree.command(name="wipe", description="Delete all messages in this channel (Admin only)", guild=target_guild)
@@ -1105,7 +1581,7 @@ start_discord_bot()
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
-    logger.info(f"Super Brain Dev Team v5.4-hydra starting on :{port}")
+    logger.info(f"Super Brain Dev Team v5.5-memory starting on :{port}")
     logger.info(f"Models: Gemma (bridge) + Grok + Codex + Opus + DeepSeek")
     logger.info(f"Discord: {'enabled' if DISCORD_TOKEN else 'disabled (no token)'}")
     app.run(host='0.0.0.0', port=port)
