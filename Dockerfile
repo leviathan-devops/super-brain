@@ -1,5 +1,6 @@
-# Leviathan Super Brain Dev Team v5.0 — Staged Pipeline
-# Gemma(I/O) → Opus+DeepSeek(arch) → Grok×2(prototype) → Codex×2(production) → Opus(review) → Gemma(deliver)
+# Leviathan Super Brain Dev Team v5.2 — Gated Pipeline
+# Fast path: Gemma→DeepSeek V3→Gemma (FREE/cheap)
+# Build path: DeepSeek R1→Opus→Grok×N→Codex×N→DeepSeek R1(verify)→Gemma
 FROM python:3.11-slim
 
 RUN pip install --no-cache-dir flask gunicorn requests "discord.py>=2.3"
@@ -11,4 +12,6 @@ ENV PYTHONUNBUFFERED=1
 
 EXPOSE 8080
 
-CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--timeout", "300", "--workers", "2", "--threads", "4", "team_server:app"]
+# timeout=0 disables worker timeout — allows multi-hour builds
+# graceful-timeout=7200 gives workers 2hrs to finish before hard kill on redeploy
+CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--timeout", "0", "--graceful-timeout", "7200", "--workers", "2", "--threads", "4", "team_server:app"]

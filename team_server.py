@@ -37,6 +37,83 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 app.config['JSON_SORT_KEYS'] = False
 
+# ─── Token Budget Management ─────────────────────────────────
+# Prevents runaway credit burn. Tracks cumulative spend per build and per day.
+
+class TokenBudget:
+    """Thread-safe token + cost tracker. Prevents runaway builds."""
+
+    # Cost per million tokens (approximate, from provider pricing)
+    COST_PER_M = {
+        'deepseek-chat': {'input': 0.27, 'output': 1.10},
+        'deepseek-reasoner': {'input': 0.55, 'output': 2.19},
+        'claude-opus-4-6': {'input': 15.00, 'output': 75.00},
+        'grok-4-1-fast-reasoning': {'input': 3.00, 'output': 15.00},
+        'gpt-5.3-codex': {'input': 2.00, 'output': 8.00},
+        'google/gemma-3-27b-it': {'input': 0.00, 'output': 0.00},  # FREE
+    }
+
+    def __init__(self, daily_cap_usd=20.0, build_cap_usd=15.0):
+        self.daily_cap = daily_cap_usd
+        self.build_cap = build_cap_usd
+        self.lock = threading.Lock()
+        self.daily_spend = 0.0
+        self.daily_reset_date = datetime.now().date()
+        self.current_build_spend = 0.0
+        self.total_tokens = {'input': 0, 'output': 0}
+
+    def estimate_cost(self, model, input_tokens, output_tokens):
+        """Estimate USD cost for a call."""
+        rates = self.COST_PER_M.get(model, {'input': 1.0, 'output': 3.0})
+        return (input_tokens * rates['input'] + output_tokens * rates['output']) / 1_000_000
+
+    def record(self, model, input_tokens, output_tokens):
+        """Record token usage. Returns estimated cost."""
+        cost = self.estimate_cost(model, input_tokens, output_tokens)
+        with self.lock:
+            today = datetime.now().date()
+            if today != self.daily_reset_date:
+                self.daily_spend = 0.0
+                self.daily_reset_date = today
+            self.daily_spend += cost
+            self.current_build_spend += cost
+            self.total_tokens['input'] += input_tokens
+            self.total_tokens['output'] += output_tokens
+        return cost
+
+    def can_proceed(self):
+        """Check if we're within budget."""
+        with self.lock:
+            today = datetime.now().date()
+            if today != self.daily_reset_date:
+                self.daily_spend = 0.0
+                self.daily_reset_date = today
+            return self.daily_spend < self.daily_cap and self.current_build_spend < self.build_cap
+
+    def reset_build(self):
+        """Reset build-level spend counter for a new build."""
+        with self.lock:
+            self.current_build_spend = 0.0
+
+    def status(self):
+        with self.lock:
+            return {
+                'daily_spend_usd': round(self.daily_spend, 4),
+                'daily_cap_usd': self.daily_cap,
+                'build_spend_usd': round(self.current_build_spend, 4),
+                'build_cap_usd': self.build_cap,
+                'total_tokens': self.total_tokens.copy(),
+                'budget_ok': self.daily_spend < self.daily_cap,
+            }
+
+# Budget: $25/model × 5 models = $125 total. Cap conservatively.
+# Build cap = $100 (one mega-build). Daily cap = $100.
+# Adjustable via Railway env vars if needed.
+budget = TokenBudget(
+    daily_cap_usd=float(os.environ.get('DAILY_BUDGET_USD', '100.0')),
+    build_cap_usd=float(os.environ.get('BUILD_BUDGET_USD', '100.0')),
+)
+
 # ─── API Configuration ────────────────────────────────────────
 
 API_KEYS = {
@@ -63,7 +140,7 @@ MODELS = {
         'role': 'Lead Engineer + Debugger + Reviewer (2M context)',
         'provider': 'xai',
         'model': 'grok-4-1-fast-reasoning',
-        'max_tokens': 4096,
+        'max_tokens': 16384,
         'cost': 'paid',
     },
     'codex': {
@@ -71,7 +148,7 @@ MODELS = {
         'role': 'Production Engineer + Code Review',
         'provider': 'openai',
         'model': 'gpt-5.3-codex',
-        'max_tokens': 4096,
+        'max_tokens': 16384,
         'cost': 'paid',
     },
     'opus': {
@@ -79,7 +156,7 @@ MODELS = {
         'role': 'Systems Architect (design decisions only)',
         'provider': 'anthropic',
         'model': 'claude-opus-4-6',
-        'max_tokens': 2048,
+        'max_tokens': 4096,
         'cost': 'paid',
     },
     'deepseek_reason': {
@@ -87,7 +164,7 @@ MODELS = {
         'role': 'Deep Reasoning + Verification',
         'provider': 'deepseek',
         'model': 'deepseek-reasoner',
-        'max_tokens': 2048,
+        'max_tokens': 8192,
         'cost': 'paid',
     },
     'deepseek_chat': {
@@ -112,14 +189,30 @@ API_TIMEOUTS = {
 
 
 def call_model(model_key, system_prompt, user_message, max_tokens=None):
-    """Call any model. Returns (text, token_info) or (None, error_string)."""
+    """Call any model. Returns (text, token_info) or (None, error_string).
+    Tracks token usage against budget. Refuses if budget exceeded."""
     cfg = MODELS[model_key]
     provider = cfg['provider']
     model = cfg['model']
     mt = max_tokens or cfg['max_tokens']
     timeout = API_TIMEOUTS.get(provider, 30)
 
+    # Budget gate — skip free models (Gemma)
+    if cfg.get('cost') != 'free' and not budget.can_proceed():
+        logger.warning(f"[BUDGET] Budget exceeded — refusing {model_key} call. {budget.status()}")
+        return None, "BUDGET_EXCEEDED"
+
+    def _record_and_return(text, tok_dict):
+        """Record budget and return."""
+        if isinstance(tok_dict, dict) and cfg.get('cost') != 'free':
+            cost = budget.record(model, tok_dict.get('input', 0), tok_dict.get('output', 0))
+            logger.info(f"[BUDGET] {model_key}: ${cost:.4f} | Build: ${budget.current_build_spend:.4f} | Daily: ${budget.daily_spend:.4f}")
+        return text, tok_dict
+
     try:
+        text_out = None
+        tok_out = {'input': 0, 'output': 0}
+
         if provider == 'openrouter':
             resp = requests.post(
                 'https://openrouter.ai/api/v1/chat/completions',
@@ -132,10 +225,9 @@ def call_model(model_key, system_prompt, user_message, max_tokens=None):
             )
             resp.raise_for_status()
             d = resp.json()
-            return d['choices'][0]['message']['content'], {
-                'input': d.get('usage', {}).get('prompt_tokens', 0),
-                'output': d.get('usage', {}).get('completion_tokens', 0),
-            }
+            text_out = d['choices'][0]['message']['content']
+            tok_out = {'input': d.get('usage', {}).get('prompt_tokens', 0),
+                       'output': d.get('usage', {}).get('completion_tokens', 0)}
 
         elif provider == 'anthropic':
             resp = requests.post(
@@ -147,10 +239,9 @@ def call_model(model_key, system_prompt, user_message, max_tokens=None):
             )
             resp.raise_for_status()
             d = resp.json()
-            return d['content'][0]['text'], {
-                'input': d.get('usage', {}).get('input_tokens', 0),
-                'output': d.get('usage', {}).get('output_tokens', 0),
-            }
+            text_out = d['content'][0]['text']
+            tok_out = {'input': d.get('usage', {}).get('input_tokens', 0),
+                       'output': d.get('usage', {}).get('output_tokens', 0)}
 
         elif provider == 'openai':
             resp = requests.post(
@@ -164,10 +255,9 @@ def call_model(model_key, system_prompt, user_message, max_tokens=None):
             )
             resp.raise_for_status()
             d = resp.json()
-            return d['choices'][0]['message']['content'], {
-                'input': d.get('usage', {}).get('prompt_tokens', 0),
-                'output': d.get('usage', {}).get('completion_tokens', 0),
-            }
+            text_out = d['choices'][0]['message']['content']
+            tok_out = {'input': d.get('usage', {}).get('prompt_tokens', 0),
+                       'output': d.get('usage', {}).get('completion_tokens', 0)}
 
         elif provider == 'xai':
             resp = requests.post(
@@ -181,10 +271,9 @@ def call_model(model_key, system_prompt, user_message, max_tokens=None):
             )
             resp.raise_for_status()
             d = resp.json()
-            return d['choices'][0]['message']['content'], {
-                'input': d.get('usage', {}).get('prompt_tokens', 0),
-                'output': d.get('usage', {}).get('completion_tokens', 0),
-            }
+            text_out = d['choices'][0]['message']['content']
+            tok_out = {'input': d.get('usage', {}).get('prompt_tokens', 0),
+                       'output': d.get('usage', {}).get('completion_tokens', 0)}
 
         elif provider == 'deepseek':
             # DeepSeek Reasoner (R1) doesn't support system messages — merge into user
@@ -204,12 +293,15 @@ def call_model(model_key, system_prompt, user_message, max_tokens=None):
             resp.raise_for_status()
             d = resp.json()
             msg = d['choices'][0]['message']
-            # R1 puts reasoning in reasoning_content; content may be null
-            text = msg.get('content') or msg.get('reasoning_content') or ''
-            return text, {
-                'input': d.get('usage', {}).get('prompt_tokens', 0),
-                'output': d.get('usage', {}).get('completion_tokens', 0),
-            }
+            text_out = msg.get('content') or msg.get('reasoning_content') or ''
+            tok_out = {'input': d.get('usage', {}).get('prompt_tokens', 0),
+                       'output': d.get('usage', {}).get('completion_tokens', 0)}
+
+        else:
+            return None, f"unknown_provider: {provider}"
+
+        # Record budget
+        return _record_and_return(text_out, tok_out)
 
     except Exception as e:
         logger.error(f"[{model_key}] API error: {e}")
@@ -356,6 +448,7 @@ def run_pipeline(user_message):
     # BUILD PATH — Full staged pipeline (build/deploy/create detected)
     # ═══════════════════════════════════════════════════════════════
     result['task_type'] = 'build'
+    budget.reset_build()  # Fresh build budget counter
     logger.info(f"[BUILD] *** FULL PIPELINE TRIGGERED *** for: {user_message[:100]}...")
 
     MAX_FIX_ROUNDS = 2  # Max verification-fix loops before shipping
@@ -577,6 +670,7 @@ def run_pipeline(user_message):
     result['response'] = delivery_text or production_text
     result['processing_time'] = f"{time.time() - start:.2f}s"
     result['fix_rounds'] = fix_round if 'fix_round' in dir() else 0
+    result['budget'] = budget.status()
     return result
 
 
@@ -599,6 +693,11 @@ def api_chat():
 @app.route('/health')
 def health():
     return jsonify({'status': 'healthy', 'version': '5.2-gated', 'timestamp': datetime.now().isoformat()})
+
+
+@app.route('/budget')
+def budget_status():
+    return jsonify(budget.status())
 
 
 @app.route('/status')
