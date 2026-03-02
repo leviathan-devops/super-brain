@@ -848,14 +848,20 @@ def start_discord_bot():
 
     # ── /build slash command ──────────────────────────────────
     @tree.command(name="build", description="Activate the full dev pipeline (DeepSeek R1 → Opus → Grok → Codex → verification)", guild=target_guild)
-    @discord.app_commands.describe(task="What do you want the dev team to build?")
-    async def build_command(interaction: discord.Interaction, task: str):
+    @discord.app_commands.describe(task="What do you want the dev team to build?", file="Attach a file (code, config, etc.) for context")
+    async def build_command(interaction: discord.Interaction, task: str, file: discord.Attachment = None):
         # Defer immediately — builds take a long time
         await interaction.response.defer()
         loop = asyncio.get_event_loop()
         try:
+            # Read attached file if provided
+            full_task = task
+            if file:
+                file_content = await _read_attachments([file])
+                if file_content:
+                    full_task = f"{task}\n\n{file_content}"
             # Force build gate by prepending /build
-            result = await loop.run_in_executor(None, run_pipeline, f"/build {task}")
+            result = await loop.run_in_executor(None, run_pipeline, f"/build {full_task}")
             response_text = result.get('response', 'No response generated.')
             models = result.get('models_used', [])
             proc_time = result.get('processing_time', '?')
@@ -888,6 +894,32 @@ def start_discord_bot():
         except Exception as e:
             logger.error(f"Failed to sync slash commands: {e}", exc_info=True)
 
+    # ── Helper: download text from Discord attachments ──────────
+    async def _read_attachments(attachments):
+        """Download and return text content from Discord message attachments."""
+        texts = []
+        TEXT_EXTENSIONS = {'.txt', '.py', '.js', '.ts', '.jsx', '.tsx', '.json', '.yaml', '.yml',
+                          '.toml', '.md', '.html', '.css', '.sh', '.bash', '.sql', '.env',
+                          '.cfg', '.ini', '.xml', '.csv', '.log', '.rs', '.go', '.java',
+                          '.c', '.cpp', '.h', '.hpp', '.rb', '.php', '.swift', '.kt',
+                          '.dockerfile', '.tf', '.hcl'}
+        for att in attachments:
+            # Check file extension or content type
+            name = att.filename.lower()
+            ext = '.' + name.rsplit('.', 1)[-1] if '.' in name else ''
+            is_text = ext in TEXT_EXTENSIONS or (att.content_type and att.content_type.startswith('text/'))
+            if is_text and att.size <= 500_000:  # 500KB max per file
+                try:
+                    data = await att.read()
+                    file_text = data.decode('utf-8', errors='replace')
+                    texts.append(f"── FILE: {att.filename} ──\n{file_text}")
+                except Exception as e:
+                    logger.warning(f"Failed to read attachment {att.filename}: {e}")
+                    texts.append(f"── FILE: {att.filename} (failed to read: {e}) ──")
+            elif att.size > 500_000:
+                texts.append(f"── FILE: {att.filename} (skipped, {att.size/1024:.0f}KB too large) ──")
+        return '\n\n'.join(texts)
+
     # ── Regular messages → fast path only (no build) ──────────
     @bot.event
     async def on_message(message):
@@ -900,6 +932,12 @@ def start_discord_bot():
             content = content.replace(f'<@{bot.user.id}>', '').replace(f'<@!{bot.user.id}>', '').strip()
         if content.startswith('!team'):
             content = content[5:].strip()
+
+        # Read any attached text files and append to message
+        if message.attachments:
+            file_content = await _read_attachments(message.attachments)
+            if file_content:
+                content = f"{content}\n\n{file_content}" if content else file_content
 
         if not content:
             return
